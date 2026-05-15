@@ -1,0 +1,207 @@
+{
+  "displayName": "Managed services contract (iO-theme)",
+  "document": {
+    "shellBackground": "#F4F4F4",
+    "pageBackground": "#FFFFFF",
+    "pageMaxWidth": "800px",
+    "pagePadding": "56px 64px",
+    "pageMarginY": "28px",
+    "pageRadius": "0px",
+    "pageShadow": "0 1px 4px rgba(0, 0, 0, 0.06)",
+    "pageBorder": "1px solid rgba(0, 0, 0, 0.08)"
+  },
+  "cover": {
+    "enabled": true,
+    "background": "linear-gradient(155deg, #0011AA 0%, #0019FF 52%, #2d4bdc 100%)",
+    "color": "#FFFFFF",
+    "minHeight": "72vh",
+    "padding": "56px 48px",
+    "subtitleText": "",
+    "showDocumentTitle": true,
+    "title": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "2.25rem",
+      "weight": "600",
+      "lineHeight": "1.2",
+      "letterSpacing": "-0.02em"
+    },
+    "meta": {
+      "family": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+      "size": "1rem",
+      "color": "rgba(255,255,255,0.82)"
+    }
+  },
+  "endPage": {
+    "enabled": true,
+    "background": "#F4F4F4",
+    "color": "#404040",
+    "minHeight": "32vh",
+    "padding": "40px 48px",
+    "titleText": "Einde document",
+    "bodyText": "",
+    "title": {
+      "family": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+      "size": "1.35rem",
+      "weight": "600"
+    },
+    "body": {
+      "family": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+      "size": "0.95rem",
+      "lineHeight": "1.6"
+    }
+  },
+  "toc": {
+    "enabled": true,
+    "heading": "Inhoudsopgave",
+    "linkColor": "#0019FF",
+    "borderBottom": "1px solid rgba(0, 0, 0, 0.1)",
+    "headingStyle": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "1.65rem",
+      "weight": "700",
+      "marginBottom": "16px",
+      "color": "#000000"
+    },
+    "itemStyle": {
+      "family": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+      "size": "0.98rem",
+      "lineHeight": "1.45"
+    },
+    "containerPadding": "0 0 28px",
+    "maxWidth": "100%"
+  },
+  "prose": {
+    "fontFamily": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+    "fontSize": "11pt",
+    "lineHeight": "1.45",
+    "color": "#000000",
+    "paragraphMargin": "0 0 0.85em"
+  },
+  "headings": {
+    "h1": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "25pt",
+      "weight": "600",
+      "marginTop": "0",
+      "marginBottom": "0.55em",
+      "color": "#000000"
+    },
+    "h2": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "20pt",
+      "weight": "600",
+      "marginTop": "1.85em",
+      "marginBottom": "0.45em",
+      "color": "#000000"
+    },
+    "h3": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "16pt",
+      "weight": "600",
+      "marginTop": "1.6em",
+      "marginBottom": "0.35em",
+      "color": "#C4D1CE"
+    },
+    "h4": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "14pt",
+      "weight": "600",
+      "style": "italic",
+      "marginTop": "1.35em",
+      "marginBottom": "0.3em",
+      "color": "#E1CFBF"
+    },
+    "h5": {
+      "family": "'TT Commons Pro', 'TT Commons Pro Medium', 'Source Sans 3', system-ui, sans-serif",
+      "size": "12pt",
+      "weight": "600",
+      "marginTop": "1.15em",
+      "marginBottom": "0.25em",
+      "color": "#BDCAD1"
+    },
+    "h6": {
+      "family": "'TT Commons Pro', 'Source Sans 3', system-ui, sans-serif",
+      "size": "11pt",
+      "weight": "600",
+      "marginTop": "1em",
+      "marginBottom": "0.2em",
+      "color": "#58716B"
+    }
+  },
+  "blockquote": {
+    "marginTop": "0.75em",
+    "marginBottom": "0.75em",
+    "padding": "12px 16px",
+    "borderLeft": "3px solid #C4D1CE",
+    "background": "#F9F9F9",
+    "color": "#404040",
+    "fontStyle": "normal"
+  },
+  "lists": {
+    "ul": {
+      "marginTop": "0.25em",
+      "marginBottom": "0.75em",
+      "paddingLeft": "1.25rem",
+      "itemMargin": "0.28em 0",
+      "markerColor": "#BDCAD1"
+    },
+    "ol": {
+      "marginTop": "0.25em",
+      "marginBottom": "0.75em",
+      "paddingLeft": "1.25rem",
+      "itemMargin": "0.28em 0"
+    }
+  },
+  "table": {
+    "width": "100%",
+    "borderCollapse": "collapse",
+    "marginTop": "1em",
+    "marginBottom": "1.25em",
+    "borderColor": "#E1CFBF",
+    "headerBackground": "#E1CFBF",
+    "headerColor": "#FFFFFF",
+    "headerFontWeight": "600",
+    "cellPadding": "10px 12px",
+    "rowAlternateBackground": "#FFFFFF",
+    "fontSize": "10pt"
+  },
+  "hr": {
+    "border": "none",
+    "borderTop": "1px solid #DCC8C2",
+    "marginTop": "1.5rem",
+    "marginBottom": "1.5rem"
+  },
+  "code": {
+    "fontFamily": "ui-monospace, Consolas, monospace",
+    "fontSize": "0.9em",
+    "background": "#F4F4F4",
+    "color": "#000000",
+    "padding": "2px 5px",
+    "borderRadius": "3px",
+    "blockPadding": "12px 14px",
+    "blockBorder": "1px solid rgba(0, 0, 0, 0.08)"
+  },
+  "link": {
+    "color": "#0019FF",
+    "textDecoration": "underline",
+    "textUnderlineOffset": "2px"
+  },
+  "strong": {
+    "fontWeight": "700",
+    "color": "#000000"
+  },
+  "em": {
+    "fontStyle": "italic"
+  },
+  "print": {
+    "h1PageBreakBefore": true,
+    "h2PageBreakBefore": true
+  },
+  "screen": {
+    "chapterDividerBeforeH1": false,
+    "chapterDividerBeforeH2": false,
+    "visualPageBreaks": true,
+    "visualPageSplit": "h1",
+    "visualPageMinHeight": "72vh"
+  }
+}

@@ -1,0 +1,222 @@
+{
+  "displayName": "Juridisch contract (zakelijk)",
+  "document": {
+    "shellBackground": "#e7e5e0",
+    "pageBackground": "#fafaf8",
+    "pageMaxWidth": "720px",
+    "pagePadding": "52px 56px",
+    "pageMarginY": "24px",
+    "pageRadius": "1px",
+    "pageShadow": "0 2px 12px rgba(17, 24, 39, 0.06)",
+    "pageBorder": "1px solid rgba(17, 24, 39, 0.09)"
+  },
+  "cover": {
+    "enabled": true,
+    "background": "linear-gradient(165deg, #111827 0%, #1f2937 48%, #374151 100%)",
+    "color": "#f9fafb",
+    "minHeight": "68vh",
+    "padding": "52px 44px",
+    "subtitleText": "Zakelijke overeenkomst · concept",
+    "showDocumentTitle": true,
+    "metaText": "",
+    "title": {
+      "family": "'Source Serif 4', 'Libre Baskerville', Georgia, serif",
+      "size": "2rem",
+      "weight": "600",
+      "lineHeight": "1.22",
+      "letterSpacing": "-0.02em",
+      "marginBottom": "14px"
+    },
+    "subtitle": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "0.82rem",
+      "weight": "600",
+      "letterSpacing": "0.14em",
+      "color": "rgba(249,250,251,0.72)",
+      "marginBottom": "10px"
+    },
+    "meta": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "0.88rem",
+      "color": "rgba(249,250,251,0.58)"
+    }
+  },
+  "endPage": {
+    "enabled": true,
+    "background": "#ededea",
+    "color": "#374151",
+    "minHeight": "36vh",
+    "padding": "44px 44px",
+    "titleText": "Einde overeenkomst",
+    "bodyText": "Dit document is een concept. Laat juridische teksten altijd beoordelen voordat u ze ondertekent.",
+    "title": {
+      "family": "'Source Serif 4', Georgia, serif",
+      "size": "1.45rem",
+      "weight": "600",
+      "marginBottom": "10px"
+    },
+    "body": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "0.95rem",
+      "lineHeight": "1.65",
+      "color": "#4b5563"
+    }
+  },
+  "toc": {
+    "enabled": true,
+    "heading": "Inhoud",
+    "linkColor": "#111827",
+    "borderBottom": "2px solid rgba(17, 24, 39, 0.12)",
+    "headingStyle": {
+      "family": "'Source Serif 4', Georgia, serif",
+      "size": "1.45rem",
+      "weight": "600",
+      "marginBottom": "14px",
+      "color": "#111827"
+    },
+    "itemStyle": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "0.94rem",
+      "lineHeight": "1.42"
+    },
+    "containerPadding": "0 0 26px",
+    "maxWidth": "100%"
+  },
+  "prose": {
+    "fontFamily": "'Source Serif 4', Georgia, serif",
+    "fontSize": "11pt",
+    "lineHeight": "1.58",
+    "color": "#1f2937",
+    "paragraphMargin": "0 0 0.75em",
+    "maxWidth": "100%"
+  },
+  "headings": {
+    "h1": {
+      "family": "'Source Serif 4', Georgia, serif",
+      "size": "22pt",
+      "weight": "700",
+      "marginTop": "0",
+      "marginBottom": "0.5em",
+      "color": "#111827",
+      "letterSpacing": "-0.015em"
+    },
+    "h2": {
+      "family": "'Source Serif 4', Georgia, serif",
+      "size": "13pt",
+      "weight": "700",
+      "marginTop": "1.65em",
+      "marginBottom": "0.4em",
+      "color": "#111827",
+      "letterSpacing": "0.05em"
+    },
+    "h3": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "11pt",
+      "weight": "700",
+      "marginTop": "1.35em",
+      "marginBottom": "0.32em",
+      "color": "#374151"
+    },
+    "h4": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "10.5pt",
+      "weight": "700",
+      "marginTop": "1.15em",
+      "marginBottom": "0.28em",
+      "color": "#4b5563"
+    },
+    "h5": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "10pt",
+      "weight": "600",
+      "marginTop": "1em",
+      "marginBottom": "0.22em",
+      "color": "#6b7280"
+    },
+    "h6": {
+      "family": "'Source Sans 3', system-ui, sans-serif",
+      "size": "9.75pt",
+      "weight": "600",
+      "marginTop": "0.9em",
+      "marginBottom": "0.18em",
+      "color": "#9ca3af",
+      "style": "italic"
+    }
+  },
+  "blockquote": {
+    "marginTop": "0.65em",
+    "marginBottom": "0.65em",
+    "padding": "11px 14px",
+    "borderLeft": "3px solid #374151",
+    "background": "rgba(243, 244, 246, 0.95)",
+    "color": "#374151",
+    "fontStyle": "italic"
+  },
+  "lists": {
+    "ul": {
+      "marginTop": "0.2em",
+      "marginBottom": "0.65em",
+      "paddingLeft": "1.2rem",
+      "itemMargin": "0.22em 0",
+      "markerColor": "#6b7280"
+    },
+    "ol": {
+      "marginTop": "0.2em",
+      "marginBottom": "0.65em",
+      "paddingLeft": "1.25rem",
+      "itemMargin": "0.22em 0"
+    }
+  },
+  "table": {
+    "width": "100%",
+    "borderCollapse": "collapse",
+    "marginTop": "0.85em",
+    "marginBottom": "1.1em",
+    "borderColor": "#d1d5db",
+    "headerBackground": "#f3f4f6",
+    "headerColor": "#111827",
+    "headerFontWeight": "700",
+    "cellPadding": "8px 10px",
+    "rowAlternateBackground": "#fafaf8",
+    "fontSize": "10pt"
+  },
+  "hr": {
+    "border": "none",
+    "borderTop": "1px solid rgba(17, 24, 39, 0.14)",
+    "marginTop": "1.35rem",
+    "marginBottom": "1.35rem"
+  },
+  "code": {
+    "fontFamily": "ui-monospace, Consolas, monospace",
+    "fontSize": "0.88em",
+    "background": "#f3f4f6",
+    "color": "#111827",
+    "padding": "2px 5px",
+    "borderRadius": "2px",
+    "blockPadding": "10px 12px",
+    "blockBorder": "1px solid rgba(17, 24, 39, 0.08)"
+  },
+  "link": {
+    "color": "#1f2937",
+    "textDecoration": "underline",
+    "textUnderlineOffset": "2px"
+  },
+  "strong": {
+    "fontWeight": "700",
+    "color": "#111827"
+  },
+  "em": {
+    "fontStyle": "italic"
+  },
+  "print": {
+    "h1PageBreakBefore": true,
+    "h2PageBreakBefore": true
+  },
+  "screen": {
+    "chapterDividerBeforeH1": false,
+    "chapterDividerBeforeH2": false,
+    "visualPageBreaks": true,
+    "visualPageSplit": "h1",
+    "visualPageMinHeight": "74vh"
+  }
+}

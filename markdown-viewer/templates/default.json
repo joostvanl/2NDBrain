@@ -1,0 +1,13 @@
+{
+  "print": {
+    "h1PageBreakBefore": true,
+    "h2PageBreakBefore": true
+  },
+  "screen": {
+    "chapterDividerBeforeH1": false,
+    "chapterDividerBeforeH2": false,
+    "visualPageBreaks": true,
+    "visualPageSplit": "h1",
+    "visualPageMinHeight": "72vh"
+  }
+}

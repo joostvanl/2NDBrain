@@ -1,0 +1,94 @@
+{
+  "displayName": "Strak zwart-wit",
+  "document": {
+    "shellBackground": "#dcdcdc",
+    "pageBackground": "#ffffff",
+    "pageMaxWidth": "760px",
+    "pagePadding": "52px 58px",
+    "pageMarginY": "28px",
+    "pageShadow": "0 6px 24px rgba(0,0,0,0.08)"
+  },
+  "cover": {
+    "enabled": true,
+    "background": "#ffffff",
+    "color": "#111111",
+    "minHeight": "70vh",
+    "padding": "56px",
+    "subtitleText": "",
+    "title": {
+      "family": "'Inter', system-ui, sans-serif",
+      "size": "2.4rem",
+      "weight": "700",
+      "lineHeight": "1.15"
+    }
+  },
+  "endPage": {
+    "enabled": true,
+    "background": "#f5f5f5",
+    "color": "#222222",
+    "titleText": "",
+    "bodyText": "",
+    "minHeight": "30vh",
+    "title": { "family": "'Inter', system-ui, sans-serif", "size": "1.25rem", "weight": "700" }
+  },
+  "toc": {
+    "enabled": true,
+    "heading": "Inhoud",
+    "linkColor": "#111111",
+    "borderBottom": "1px solid #11111133"
+  },
+  "prose": {
+    "fontFamily": "'Inter', system-ui, sans-serif",
+    "fontSize": "15.75px",
+    "lineHeight": "1.7",
+    "color": "#1a1a1a"
+  },
+  "headings": {
+    "h1": {
+      "family": "'Inter', system-ui, sans-serif",
+      "size": "1.85rem",
+      "weight": "800",
+      "marginTop": "2rem",
+      "marginBottom": "0.75rem",
+      "color": "#080808"
+    },
+    "h2": {
+      "family": "'Inter', system-ui, sans-serif",
+      "size": "1.45rem",
+      "weight": "750",
+      "marginTop": "1.75rem",
+      "marginBottom": "0.55rem"
+    },
+    "h3": {
+      "family": "'Inter', system-ui, sans-serif",
+      "size": "1.2rem",
+      "weight": "700",
+      "marginTop": "1.35rem",
+      "marginBottom": "0.4rem"
+    }
+  },
+  "table": {
+    "headerBackground": "#111111",
+    "headerColor": "#ffffff",
+    "borderColor": "#11111122",
+    "rowAlternateBackground": "#fafafa"
+  },
+  "blockquote": {
+    "borderLeft": "3px solid #111111",
+    "background": "#f7f7f7",
+    "color": "#333333",
+    "fontStyle": "normal"
+  },
+  "link": { "color": "#0b5fff", "textDecoration": "underline" },
+  "print": {
+    "h1PageBreakBefore": true,
+    "h2PageBreakBefore": true
+  },
+  "screen": {
+    "chapterDividerBeforeH1": false,
+    "chapterDividerBeforeH2": false,
+    "visualPageBreaks": true,
+    "visualPageSplit": "h1",
+    "visualPageMinHeight": "70vh"
+  }
+}

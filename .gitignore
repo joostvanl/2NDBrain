@@ -1,0 +1,26 @@
+# Secrets & lokale config (nooit committen)
+.env
+.env.local
+**/agent.config.json
+markdown-viewer/agent.config
+
+# Dependencies & build
+**/node_modules/
+markdown-viewer/dist/
+
+# Tijdelijk & huishoudelijk
+markdown-viewer/.tmp/
+**/_curl_export.json
+
+# Editor / OS
+.idea/
+.vscode/
+*.log
+Thumbs.db
+.DS_Store
+
+# Review-backups (grote churn, lokaal herleidbaar)
+Files/.reviews/.versions/
+
+# Losse Office-bestanden in de repo-root (exporten / per ongeluk gekopieerd)
+/*.docx

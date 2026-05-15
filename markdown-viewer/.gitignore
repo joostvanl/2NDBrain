@@ -1,0 +1,5 @@
+agent.config.json
+agent.config
+.tmp/
+.env
+.env.local

@@ -1,0 +1,57 @@
+# Markdown-viewer + DOCX-export (LLM2DOCX) — geen Python/Node op de host nodig.
+# Start vanaf deze map:
+#   docker compose up -d --build
+# Open: http://127.0.0.1:8787
+#
+# Vereist: map ../../LLM2DOCX (sibling van iOMS op webroot) met templates/*.docx .
+# Markdown-bestanden: ../Files wordt in de container op /data/files gemount.
+
+name: markdown-viewer-stack
+
+services:
+  docx-export:
+    build:
+      context: ../../LLM2DOCX
+      dockerfile: Dockerfile.docx-api
+    image: word-generator-docx-api:local
+    environment:
+      TEMPLATES_DIR: /templates
+      OUTPUT_DIR: /output
+      DOCX_EXPORT_SERVICE_TOKEN: ${DOCX_EXPORT_TOKEN:-}
+    volumes:
+      - ../../LLM2DOCX/templates:/templates
+      - docx-export-work:/output
+    ports:
+      - "127.0.0.1:8790:8790"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8787}:8787"
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      MARKDOWN_DIR: /data/files
+      REVIEWS_DIR: /data/files/.reviews
+      DOCX_EXPORT_URL: http://docx-export:8790
+      DOCX_EXPORT_TOKEN: ${DOCX_EXPORT_TOKEN:-}
+    volumes:
+      - ../Files:/data/files
+    depends_on:
+      docx-export:
+        condition: service_healthy
+
+volumes:
+  docx-export-work:

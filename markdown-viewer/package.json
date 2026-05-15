@@ -1,0 +1,29 @@
+{
+  "name": "markdown-viewer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/run-dev.mjs",
+    "dev:unified": "node server/index.mjs --dev",
+    "build": "tsc && vite build",
+    "start": "node server/index.mjs",
+    "preview": "npm run build && npm run start",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.4",
+    "express": "^4.21.2",
+    "marked": "^15.0.6",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "devDependencies": {
+    "@types/dompurify": "^3.0.5",
+    "@types/turndown": "^5.0.6",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.11",
+    "wait-on": "^8.0.1"
+  }
+}

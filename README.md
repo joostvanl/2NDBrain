@@ -41,5 +41,7 @@ git push -u origin main
 
 ## Documentatie
 
-- `docs/TECHNICAL_DEBT.md` — technical debt / verbeterpunten
-- `markdown-viewer/docs/` — o.a. agent/review-instructies
+- `markdown-viewer/docs/SOLUTION_ONBOARDING.md` — solution-overzicht en leesroute voor junior agents
+- `markdown-viewer/docs/TECHNICAL_IMPROVEMENT_BACKLOG.md` — technical debt, optimalisaties en functionele verbeterpunten
+- `markdown-viewer/docs/DOCUMENTATION_UPGRADE_PLAN.md` — benodigde documentatie-upgrades
+- `markdown-viewer/docs/` — overige technische, development- en agent/review-instructies

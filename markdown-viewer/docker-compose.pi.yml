@@ -1,0 +1,60 @@
+# Raspberry Pi 5 deployvariant voor iOMS Markdown Viewer.
+# Deze compose-file bouwt niet lokaal, maar pullt de image uit GitHub Container Registry.
+#
+# Voorbeeld:
+#   docker compose --env-file .env.pi -f docker-compose.pi.yml pull
+#   docker compose --env-file .env.pi -f docker-compose.pi.yml up -d
+
+name: ioms-pi
+
+services:
+  app:
+    image: ${IOMS_IMAGE:?Zet IOMS_IMAGE in .env.pi, bijvoorbeeld ghcr.io/<owner>/<repo>/ioms-markdown-viewer:latest}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8787}:8787"
+    environment:
+      NODE_ENV: production
+      PORT: "8787"
+      MARKDOWN_DIR: /data/files
+      MEMORY_DIR: /data/files/.memory
+      REVIEWS_DIR: /data/files/.reviews
+      TEMPLATES_DIR: /app/templates
+      AGENT_CONFIG_PATH: /data/config/agent.config.json
+      AGENT_CONFIG_LEGACY_PATH: /data/config/agent.config
+      AGENT_INSTRUCTIONS_PATH: /data/config/agent-instructions.md
+      AGENT_CHATS_PATH: /data/config/agent-chats.json
+      AGENT_ACTIVITY_LOGS_PATH: /data/config/agent-activity-logs.jsonl
+      PROMPT_MACROS_PATH: /data/config/prompt-macros.json
+      IOMS_AUTH_USER: ${IOMS_AUTH_USER:-joost}
+      IOMS_AUTH_PASSWORD: ${IOMS_AUTH_PASSWORD:?Zet IOMS_AUTH_PASSWORD in .env.pi}
+      AGENT_API_KEY: ${AGENT_API_KEY:-}
+      AGENT_ENDPOINT: ${AGENT_ENDPOINT:-}
+      AGENT_MODEL: ${AGENT_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      WEB_SEARCH_TIMEOUT_MS: ${WEB_SEARCH_TIMEOUT_MS:-15000}
+      WEB_SEARCH_RESULT_MAX_CHARS: ${WEB_SEARCH_RESULT_MAX_CHARS:-4000}
+      CONFLUENCE_BASE_URL: ${CONFLUENCE_BASE_URL:-}
+      CONFLUENCE_PAT: ${CONFLUENCE_PAT:-}
+      CONFLUENCE_TIMEOUT_MS: ${CONFLUENCE_TIMEOUT_MS:-20000}
+      CONFLUENCE_PAGE_MAX_CHARS: ${CONFLUENCE_PAGE_MAX_CHARS:-60000}
+      DOCX_EXPORT_URL: ${DOCX_EXPORT_URL:-}
+      DOCX_EXPORT_STYLE: ${DOCX_EXPORT_STYLE:-minimal}
+      DOCX_EXPORT_TOKEN: ${DOCX_EXPORT_TOKEN:-}
+    volumes:
+      - ${IOMS_FILES_DIR:-/opt/ioms/files}:/data/files
+      - ${IOMS_CONFIG_DIR:-/opt/ioms/config}:/data/config
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"const u='http://127.0.0.1:8787/api/health'; const user=process.env.IOMS_AUTH_USER||'joost'; const pass=process.env.IOMS_AUTH_PASSWORD||''; const h=pass ? {Authorization:'Basic '+Buffer.from(user+':'+pass).toString('base64')} : {}; fetch(u,{headers:h}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

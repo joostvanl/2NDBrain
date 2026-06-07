@@ -8,23 +8,44 @@ import path from "path";
 import { fileURLToPath } from "url";
 import JSZip from "jszip";
 import mammoth from "mammoth";
-import { rebuildCorpusIndex, readManifest, buildCorpusAskContext } from "./corpus-index.mjs";
+import { marked } from "marked";
+import TurndownService from "turndown";
+import {
+  rebuildCorpusIndex,
+  readManifest,
+  buildCorpusAskContext,
+  extractMarkdownSections,
+  linkUnlinkedMentionsInMarkdown,
+  scoreMarkdownSectionsForQuestion,
+  retrievalBudgetForQuestion,
+  unlinkedMentionSuggestionsFromManifest,
+} from "./corpus-index.mjs";
+import {
+  MEMORY_DIRNAME,
+  safeDocxDownloadName,
+  safeDocxTemplateName,
+  safeFolderPath,
+  safeMarkdownPath,
+  safeMemoryMarkdownPath,
+  safeTemplateName,
+  suggestedMdNameFromDocxUpload,
+} from "./path-safety.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.join(__dirname, "..");
 /** Verhoog bij relevante API-gedragswijzigingen; controleer met GET /api/health of je de juiste server draait. */
 const API_HANDLER_REVISION = "2026-05-28-agent-activity-log-tool";
 const MARKDOWN_DIR = process.env.MARKDOWN_DIR || path.join(rootDir, "..", "Files");
-const MEMORY_DIRNAME = ".memory";
 const MEMORY_DIR = process.env.MEMORY_DIR || path.join(MARKDOWN_DIR, MEMORY_DIRNAME);
 const MEMORY_INDEX_DIR = path.join(MEMORY_DIR, ".mv-index");
 const MEMORY_MANIFEST_FILE = "memory-manifest.json";
 const REVIEWS_DIR = process.env.REVIEWS_DIR || path.join(MARKDOWN_DIR, ".reviews");
-const AGENT_CONFIG_PATH = path.join(rootDir, "agent.config.json");
-const AGENT_CONFIG_LEGACY_PATH = path.join(rootDir, "agent.config");
+const AGENT_CONFIG_PATH = process.env.AGENT_CONFIG_PATH || path.join(rootDir, "agent.config.json");
+const AGENT_CONFIG_LEGACY_PATH = process.env.AGENT_CONFIG_LEGACY_PATH || path.join(rootDir, "agent.config");
 const AGENT_INSTRUCTIONS_PATH = process.env.AGENT_INSTRUCTIONS_PATH || path.join(rootDir, "agent-instructions.md");
 const AGENT_CHATS_PATH = process.env.AGENT_CHATS_PATH || path.join(rootDir, "agent-chats.json");
 const AGENT_ACTIVITY_LOGS_PATH = process.env.AGENT_ACTIVITY_LOGS_PATH || path.join(rootDir, "agent-activity-logs.jsonl");
+const PROMPT_MACROS_PATH = process.env.PROMPT_MACROS_PATH || path.join(rootDir, "prompt-macros.json");
 const TEMPLATES_DIR = process.env.TEMPLATES_DIR || path.join(rootDir, "templates");
 /** Word (.docx) — integratie met project LLM2DOCX (map ernaast iOMS of via LLM2DOCX_ROOT). */
 const LLM2DOCX_ROOT = process.env.LLM2DOCX_ROOT
@@ -49,6 +70,9 @@ const apiOnly = process.argv.includes("--api-only");
 const isDev = process.argv.includes("--dev") && !apiOnly;
 const API_PORT = Number(process.env.API_PORT || 8787);
 const PORT = Number(process.env.PORT || (isDev ? 5173 : 8787));
+const IOMS_AUTH_ENABLED = process.env.IOMS_AUTH_DISABLED !== "1";
+const IOMS_AUTH_USER = (process.env.IOMS_AUTH_USER || "joost").trim() || "joost";
+const IOMS_AUTH_PASSWORD = (process.env.IOMS_AUTH_PASSWORD || "").trim();
 
 /** Zet op `1` voor extra detail (o.a. instructie-preview, elke skip-reden). */
 const AGENT_LOG_VERBOSE =
@@ -106,6 +130,18 @@ const WEB_SEARCH_TIMEOUT_MS = Math.min(
 const WEB_SEARCH_RESULT_MAX_CHARS = Math.min(
   20000,
   Math.max(800, Number(process.env.WEB_SEARCH_RESULT_MAX_CHARS || 4000) || 4000),
+);
+
+/** Optionele Confluence-integratie. PAT blijft server-side en wordt nooit naar de browser/LLM teruggegeven. */
+const CONFLUENCE_BASE_URL = String(process.env.CONFLUENCE_BASE_URL || "").trim().replace(/\/+$/, "");
+const CONFLUENCE_PAT = String(process.env.CONFLUENCE_PAT || "").trim();
+const CONFLUENCE_TIMEOUT_MS = Math.min(
+  60000,
+  Math.max(3000, Number(process.env.CONFLUENCE_TIMEOUT_MS || 20000) || 20000),
+);
+const CONFLUENCE_PAGE_MAX_CHARS = Math.min(
+  200000,
+  Math.max(2000, Number(process.env.CONFLUENCE_PAGE_MAX_CHARS || 60000) || 60000),
 );
 
 /** In-memory ring buffer; alleen voor GET /api/agent/logs (dev/diagnose). */
@@ -174,6 +210,66 @@ function truncStr(s, max) {
   return `${t.slice(0, max)}…`;
 }
 
+function approxTokensFromChars(chars) {
+  return Math.max(0, Math.ceil(Math.max(0, Number(chars) || 0) / 4));
+}
+
+function normalizeTokenUsage(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const promptTokens = Number.isFinite(raw.prompt_tokens)
+    ? raw.prompt_tokens
+    : Number.isFinite(raw.promptTokens)
+      ? raw.promptTokens
+      : 0;
+  const completionTokens = Number.isFinite(raw.completion_tokens)
+    ? raw.completion_tokens
+    : Number.isFinite(raw.completionTokens)
+      ? raw.completionTokens
+      : 0;
+  const totalTokens = Number.isFinite(raw.total_tokens)
+    ? raw.total_tokens
+    : Number.isFinite(raw.totalTokens)
+      ? raw.totalTokens
+      : promptTokens + completionTokens;
+  if (!promptTokens && !completionTokens && !totalTokens) return null;
+  return {
+    promptTokens: Math.round(promptTokens),
+    completionTokens: Math.round(completionTokens),
+    totalTokens: Math.round(totalTokens),
+  };
+}
+
+function addTokenUsage(target, usage) {
+  if (!usage) return;
+  target.promptTokens += usage.promptTokens || 0;
+  target.completionTokens += usage.completionTokens || 0;
+  target.totalTokens += usage.totalTokens || 0;
+}
+
+function finalizePerformanceMetrics(metrics, extra = {}) {
+  if (!metrics || typeof metrics !== "object") return null;
+  const durationMs = Number.isFinite(extra.durationMs)
+    ? Math.max(0, Math.round(extra.durationMs))
+    : Number.isFinite(metrics.startedAt)
+      ? Math.max(0, Date.now() - metrics.startedAt)
+      : 0;
+  const tokenUsage = metrics.tokenUsage || {};
+  const hasTokenUsage = !!(tokenUsage.promptTokens || tokenUsage.completionTokens || tokenUsage.totalTokens);
+  return {
+    durationMs,
+    llmMs: Math.max(0, Math.round(metrics.llmMs || 0)),
+    llmCallCount: Math.max(0, Math.round(metrics.llmCallCount || 0)),
+    toolCallCount: Math.max(0, Math.round(metrics.toolCallCount || 0)),
+    contextChars: Math.max(0, Math.round(metrics.contextChars || 0)),
+    approxContextTokens: approxTokensFromChars(metrics.contextChars || 0),
+    retrievedChars: Math.max(0, Math.round(metrics.retrievedChars || 0)),
+    approxRetrievedTokens: approxTokensFromChars(metrics.retrievedChars || 0),
+    replyChars: Math.max(0, Math.round(extra.replyChars || metrics.replyChars || 0)),
+    ...(hasTokenUsage ? { tokenUsage } : {}),
+    ...(metrics.retrievalMeta ? { retrievalMeta: metrics.retrievalMeta } : {}),
+  };
+}
+
 function activityLogTimestampParts(date = new Date()) {
   let localDate = "";
   let localTime = "";
@@ -220,6 +316,8 @@ function normalizeActivityLogEntry(raw) {
     corpusWide: raw?.corpusWide === true,
     webSearch: raw?.webSearch === true,
     memoryActionCount: Number.isFinite(raw?.memoryActionCount) ? Math.max(0, Math.round(raw.memoryActionCount)) : 0,
+    performanceMetrics:
+      raw?.performanceMetrics && typeof raw.performanceMetrics === "object" ? raw.performanceMetrics : undefined,
     corpusCreatedPaths: Array.isArray(raw?.corpusCreatedPaths)
       ? raw.corpusCreatedPaths.filter((p) => typeof p === "string").slice(0, 20)
       : [],
@@ -320,6 +418,14 @@ Dit bestand bevat uitsluitend gedragsregels voor de agent. Het is geen geheugen,
 - Raadpleeg relevante context voordat je aangeeft iets niet te weten.
 - Stel alleen inhoudelijke vervolgvragen wanneer ontbrekende informatie het resultaat merkbaar verbetert.
 
+## Links in werkdocumenten
+
+- Maak interne links in werkdocumenten als gewone Markdown-links: \`[zichtbare tekst](relatief/pad/Bestand.md)\`.
+- Gebruik paden relatief aan \`Files/\`; zet \`Files/\` zelf niet in de link.
+- Gebruik forward slashes (\`/\`) en behoud spaties in bestandsnamen; encodeer spaties niet als \`%20\`.
+- Escape de vierkante haken van een link niet. Schrijf dus \`[managed services](90-experiments-en-test/Managed Services.md)\`, niet \`\\[managed services\\](...)\` of \`[managed services\\](...)\`.
+- Gebruik geen wiki-links (\`[[...]]\`) wanneer je een klikbare browserlink in de markdown-viewer wilt maken.
+
 ## Grenzen
 
 - Schrijf geen persoonlijke feiten, voorkeuren, klantinformatie, projectinformatie, dossierkennis of inhoudelijke referentiedata in dit bestand.
@@ -387,80 +493,6 @@ function agentInstructionsPromptBlock() {
     agentLog("—", "agent_instructions_read_error", { error: String(e?.message || e) });
     return "";
   }
-}
-
-function safeMarkdownName(raw) {
-  if (typeof raw !== "string") return null;
-  const base = path.basename(raw);
-  if (!base.endsWith(".md") || base !== raw.trim() || base.includes("..")) return null;
-  return base;
-}
-
-function safeMarkdownPath(raw) {
-  if (typeof raw !== "string") return null;
-  const normalized = raw.trim().replace(/\\/g, "/");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0") || normalized.includes("..")) return null;
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.length === 0 || parts.some((p) => p.startsWith(".") || /[<>:"|?*]/.test(p))) return null;
-  const last = parts.at(-1);
-  if (!last?.endsWith(".md")) return null;
-  return parts.join("/");
-}
-
-function safeMemoryMarkdownPath(raw) {
-  if (typeof raw !== "string") return null;
-  const normalized = raw
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^Files\//i, "")
-    .replace(new RegExp(`^${MEMORY_DIRNAME.replace(".", "\\.")}/`, "i"), "");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0") || normalized.includes("..")) return null;
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.length === 0 || parts.some((p) => p.startsWith(".") || /[<>:"|?*]/.test(p))) return null;
-  const last = parts.at(-1);
-  if (!last?.endsWith(".md")) return null;
-  return parts.join("/");
-}
-
-function safeFolderPath(raw) {
-  if (typeof raw !== "string") return null;
-  const normalized = raw.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  if (normalized === "") return "";
-  if (normalized.includes("\0") || normalized.includes("..")) return null;
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.some((p) => p.startsWith(".") || /[<>:"|?*]/.test(p))) return null;
-  return parts.join("/");
-}
-
-function safeTemplateName(raw) {
-  if (typeof raw !== "string") return null;
-  const base = path.basename(raw);
-  if (!base.endsWith(".json") || base !== raw.trim() || base.includes("..")) return null;
-  return base;
-}
-
-/** Zelfde regel als LLM2DOCX ``paths.safe_docx_filename`` (basename, veilige tekens). */
-const SAFE_DOCX_BASENAME = /^[a-zA-Z0-9. _-]+\.docx$/;
-
-function safeDocxTemplateName(raw) {
-  if (typeof raw !== "string") return null;
-  const t = raw.trim();
-  if (!t || t.includes("..") || t.includes("/") || t.includes("\\")) return null;
-  if (path.basename(t) !== t) return null;
-  if (!SAFE_DOCX_BASENAME.test(t)) return null;
-  return t;
-}
-
-/** Naam voor een nieuw .md-bestand na DOCX-import (alleen basename; veilig voor Files/). */
-function suggestedMdNameFromDocxUpload(originalName) {
-  const fallback = `Geimporteerd-${Date.now()}.md`;
-  const raw = typeof originalName === "string" ? originalName.trim() : "";
-  const base = raw ? path.basename(raw.replace(/\\/g, "/")) : "";
-  if (!base || !base.toLowerCase().endsWith(".docx")) return fallback;
-  const stem = base.slice(0, -5);
-  if (!stem || stem.startsWith(".") || /[<>:"|?*\\/]/.test(stem)) return fallback;
-  const candidate = `${stem}.md`;
-  return safeMarkdownPath(candidate) ? candidate : fallback;
 }
 
 function memoryRootRelativePath(relPath = "") {
@@ -543,19 +575,6 @@ async function convertDocxBufferToMarkdown(buffer) {
     .trimEnd();
   if (md && !md.endsWith("\n")) md += "\n";
   return { markdown: md, messages: result.messages };
-}
-
-function safeDocxDownloadName(raw, fallback) {
-  if (typeof raw !== "string" || !raw.trim()) return fallback;
-  let t = path.basename(raw.trim().replace(/\\/g, "/"));
-  if (t.includes("..")) return fallback;
-  if (!/\.docx$/i.test(t)) {
-    const stem = t.replace(/\.[^.]+$/, "") || "export";
-    t = `${stem}.docx`;
-  }
-  if (/[<>:"/\\|?*\x00-\x1f]/.test(t)) return fallback;
-  if (t.length > 180 || t.length < 6) return fallback;
-  return t;
 }
 
 /** Zelfde patroon als LLM2DOCX ``collect_jinja_placeholder_names`` (eerste identifier na ``{{``). */
@@ -873,6 +892,131 @@ function readMarkdownFileDetails() {
   return details;
 }
 
+function secondBrainSummaryFromManifest(manifest, scope) {
+  const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+  const tagCounts = manifest?.tagCounts && typeof manifest.tagCounts === "object" ? manifest.tagCounts : {};
+  const relationEntries = entries
+    .map((entry) => ({
+      path: entry.path,
+      title: entry.title,
+      linkCount: Array.isArray(entry.linksOut) ? entry.linksOut.length : 0,
+      backlinkCount: Array.isArray(entry.backlinks) ? entry.backlinks.length : Number(entry.linksInCount || 0),
+      unlinkedMentionCount: Array.isArray(entry.unlinkedMentions) ? entry.unlinkedMentions.length : 0,
+      relatedCount: Array.isArray(entry.related) ? entry.related.length : 0,
+    }))
+    .sort(
+      (a, b) =>
+        b.backlinkCount +
+          b.linkCount +
+          b.unlinkedMentionCount -
+        (a.backlinkCount + a.linkCount + a.unlinkedMentionCount),
+    )
+    .slice(0, 25);
+  return {
+    scope,
+    generatedAt: manifest?.generatedAt || "",
+    entryCount: entries.length,
+    metadataKeys: Array.isArray(manifest?.metadataKeys) ? manifest.metadataKeys : [],
+    tagCounts,
+    relationEntries,
+    staleCandidates: entries
+      .filter((entry) => {
+        const props = entry.properties && typeof entry.properties === "object" ? entry.properties : {};
+        return /^(stale|archived|draft)$/i.test(String(props.status || props.state || ""));
+      })
+      .map((entry) => ({ path: entry.path, title: entry.title, status: entry.properties?.status || entry.properties?.state }))
+      .slice(0, 50),
+    unlinkedMentions: entries
+      .flatMap((entry) =>
+        Array.isArray(entry.unlinkedMentions)
+          ? entry.unlinkedMentions.map((mention) => ({
+              from: entry.path,
+              to: mention.path,
+              title: mention.title,
+              mention: mention.mention,
+            }))
+          : [],
+      )
+      .slice(0, 100),
+  };
+}
+
+function readSecondBrainManifestsOrThrow() {
+  const workingManifest = readManifest(MARKDOWN_DIR, { scope: "working" });
+  const memoryManifest = readManifest(MARKDOWN_DIR, { scope: "memory", indexDir: MEMORY_INDEX_DIR });
+  if (!workingManifest?.entries?.length || !memoryManifest?.entries) {
+    const err = new Error("Corpus-index ontbreekt of is leeg. Gebruik eerst POST /api/corpus-index/rebuild.");
+    err.statusCode = 404;
+    throw err;
+  }
+  return { workingManifest, memoryManifest };
+}
+
+function secondBrainUnlinkedMentionPayload(limit = 500) {
+  const { workingManifest, memoryManifest } = readSecondBrainManifestsOrThrow();
+  const working = unlinkedMentionSuggestionsFromManifest(workingManifest, { scope: "working", limit });
+  const memory = unlinkedMentionSuggestionsFromManifest(memoryManifest, { scope: "memory", limit });
+  return {
+    generatedAt: new Date().toISOString(),
+    working,
+    memory,
+    totalCount: working.length + memory.length,
+  };
+}
+
+function corpusEntryFullPath(sourceRoot, relPath) {
+  const normalized = String(relPath || "").replace(/\\/g, "/");
+  if (!normalized || normalized.startsWith("/") || normalized.split("/").includes("..")) return null;
+  const resolvedRoot = path.resolve(sourceRoot);
+  const full = path.resolve(resolvedRoot, ...normalized.split("/"));
+  if (!full.startsWith(resolvedRoot + path.sep) && full !== resolvedRoot) return null;
+  return full;
+}
+
+function applyUnlinkedMentionSuggestionsForScope(scope, manifest, sourceRoot, opts = {}) {
+  const selectedIds = Array.isArray(opts.ids) && opts.ids.length ? new Set(opts.ids.map(String)) : null;
+  const allSuggestions = unlinkedMentionSuggestionsFromManifest(manifest, { scope, limit: opts.limit || 1000 });
+  const suggestions = selectedIds ? allSuggestions.filter((item) => selectedIds.has(item.id)) : allSuggestions;
+  const byFile = new Map();
+  for (const suggestion of suggestions) {
+    const list = byFile.get(suggestion.from) || [];
+    list.push(suggestion);
+    byFile.set(suggestion.from, list);
+  }
+
+  const files = [];
+  const applied = [];
+  const skipped = [];
+  for (const [from, fileSuggestions] of byFile.entries()) {
+    const full = corpusEntryFullPath(sourceRoot, from);
+    if (!full || !fs.existsSync(full)) {
+      skipped.push(...fileSuggestions.map((suggestion) => ({ ...suggestion, reason: "source-not-found" })));
+      continue;
+    }
+    const before = fs.readFileSync(full, "utf8");
+    const result = linkUnlinkedMentionsInMarkdown(before, from, fileSuggestions, {
+      maxPerFile: opts.maxPerFile || 50,
+    });
+    if (result.changed) {
+      fs.writeFileSync(full, result.content, "utf8");
+      files.push({ path: from, appliedCount: result.applied.length });
+      applied.push(...result.applied);
+    }
+    skipped.push(...result.skipped);
+  }
+
+  return {
+    scope,
+    suggestionCount: suggestions.length,
+    filesChanged: files.length,
+    appliedCount: applied.length,
+    skippedCount: skipped.length,
+    files,
+    applied,
+    skipped,
+  };
+}
+
 function readDirMemoryMarkdown(dir = MEMORY_DIR, prefix = "") {
   ensureMemoryRoot();
   if (!fs.existsSync(MEMORY_DIR)) return [];
@@ -1011,6 +1155,132 @@ function readMemoryMarkdownToolPayload(relRaw) {
   }
 }
 
+function markdownPayloadForScope(scope, relRaw) {
+  if (scope === "memory") {
+    const payload = readMemoryMarkdownToolPayload(relRaw);
+    return { ...payload, scope: "memory" };
+  }
+  const payload = readCorpusMarkdownToolPayload(relRaw);
+  return { ...payload, scope: "working" };
+}
+
+function readMarkdownOutlineToolPayload(scope, relRaw, queryRaw = "") {
+  const payload = markdownPayloadForScope(scope, relRaw);
+  if (!payload.ok) return payload;
+  const sections = extractMarkdownSections(payload.content || "");
+  const query = typeof queryRaw === "string" ? queryRaw.trim() : "";
+  const budget = retrievalBudgetForQuestion(query || relRaw);
+  const ranked = query ? scoreMarkdownSectionsForQuestion(query, sections, { limit: budget.sectionLimit }) : null;
+  const sectionsForPayload = ranked
+    ? ranked.sections
+    : sections.slice(0, budget.sectionLimit).map((s, idx) => ({ ...s, originalIndex: idx }));
+  return {
+    ok: true,
+    scope: payload.scope,
+    path: payload.path,
+    displayPath: payload.displayPath,
+    contextType: payload.contextType,
+    sectionCount: sections.length,
+    query,
+    retrievalMeta: ranked?.meta || {
+      algorithm: "document-order",
+      candidateCount: sections.length,
+      returnedCount: sectionsForPayload.length,
+    },
+    budget,
+    sections: sectionsForPayload.map((s, idx) => ({
+      index: Number.isInteger(s.originalIndex) ? s.originalIndex + 1 : idx + 1,
+      ...(query ? { rank: idx + 1 } : {}),
+      id: s.id,
+      level: s.level,
+      heading: s.heading,
+      headingPath: s.headingPath,
+      startLine: s.startLine,
+      endLine: s.endLine,
+      contentChars: s.contentChars,
+      preview:
+        s.preview.length > budget.sectionPreviewChars
+          ? `${s.preview.slice(0, budget.sectionPreviewChars)}…`
+          : s.preview,
+      ...(typeof s.score === "number" ? { score: Math.round(s.score * 1000) / 1000 } : {}),
+    })),
+    omittedSections: Math.max(0, sections.length - sectionsForPayload.length),
+    fallbackInstruction: sections.length
+      ? undefined
+      : "Geen koppen gevonden. Gebruik read_corpus_markdown/read_memory_markdown als je de volledige inhoud nodig hebt.",
+  };
+}
+
+function normalizeHeadingSelector(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s*>\s*/g, " > ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function readMarkdownSectionToolPayload(scope, relRaw, selectorRaw) {
+  const payload = markdownPayloadForScope(scope, relRaw);
+  if (!payload.ok) return payload;
+  const content = String(payload.content || "");
+  const sections = extractMarkdownSections(content);
+  if (!sections.length) {
+    return {
+      ok: false,
+      scope: payload.scope,
+      path: payload.path,
+      displayPath: payload.displayPath,
+      error: "Geen koppen of secties gevonden in dit document. Gebruik read_corpus_markdown/read_memory_markdown als fallback.",
+    };
+  }
+
+  const selector = String(selectorRaw || "").trim();
+  const selectorNorm = normalizeHeadingSelector(selector);
+  const numeric = Number(selector);
+  let match = null;
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= sections.length) match = sections[numeric - 1];
+  if (!match && selectorNorm) {
+    match =
+      sections.find((s) => normalizeHeadingSelector(s.id) === selectorNorm) ||
+      sections.find((s) => normalizeHeadingSelector(s.headingPath.join(" > ")) === selectorNorm) ||
+      sections.find((s) => normalizeHeadingSelector(s.heading) === selectorNorm);
+  }
+  if (!match) {
+    return {
+      ok: false,
+      scope: payload.scope,
+      path: payload.path,
+      displayPath: payload.displayPath,
+      error: `Sectie niet gevonden: ${selector || "(leeg)"}. Lees eerst de outline en gebruik index, id, heading of headingPath.`,
+    };
+  }
+
+  const lines = content.split(/\r?\n/);
+  const sectionBody = lines.slice(match.startLine, match.endLine).join("\n").trim();
+  const truncated = sectionBody.length > CORPUS_READ_MAX_CHARS;
+  return {
+    ok: true,
+    scope: payload.scope,
+    path: payload.path,
+    displayPath: payload.displayPath,
+    contextType: payload.contextType,
+    section: {
+      id: match.id,
+      level: match.level,
+      heading: match.heading,
+      headingPath: match.headingPath,
+      startLine: match.startLine,
+      endLine: match.endLine,
+    },
+    content: truncated
+      ? `${sectionBody.slice(0, CORPUS_READ_MAX_CHARS)}\n\n---\n*[Sectie ingekort voor contextlimiet.]*\n`
+      : sectionBody,
+    truncated,
+  };
+}
+
 /** Nieuw .md onder MARKDOWN_DIR; overschrijft niet; herbouwt corpus-index bij succes. */
 async function createCorpusMarkdownToolPayload(relRaw, contentRaw) {
   ensureMemoryRoot();
@@ -1119,8 +1389,61 @@ function ensureMemoryAppliedNotice(reply, executedActions) {
   return base;
 }
 
-function stripMemoryHousekeepingFromReply(reply, actions = []) {
+function hasMemoryWriteDeferral(reply) {
+  const text = String(reply || "");
+  if (!text.trim()) return false;
+  return (
+    /\bgeen\s+schrijfrecht(en)?\b.{0,220}\b(\.memory|memory|geheugen|long[-\s]?term)\b/is.test(text) ||
+    /\bhuidige\s+tooling\b.{0,220}\b(long[-\s]?term\s+memory|\.memory|memory|geheugen)\b.{0,220}\b(niet|geen)\b.{0,120}\b(aanpassen|bijwerken|toevoegen|schrijven|vastleggen)\b/is.test(text) ||
+    /\bkan\b.{0,100}\bniet\b.{0,120}\bzelf\b.{0,180}\b(\.memory|memory|geheugen|long[-\s]?term|toevoegen|bijschrijven|aanpassen)\b/is.test(text) ||
+    /\bzodra\b.{0,160}\b(memory[-\s]?(wijzigingen|schrijf[-\s]?tools?)|schrijfrecht(en)?|write[-\s]?tools?)\b.{0,160}\b(toegestaan|beschikbaar|weer)\b/is.test(text) ||
+    /\bhoort dit thuis in\b.{0,120}\bFiles\/\.memory\//i.test(text) ||
+    /\bje kunt\b.{0,180}\b(één-op-één|een-op-een|plakken|zelf toevoegen|zelf aanmaken)\b/is.test(text)
+  );
+}
+
+function memoryPathFromText(text) {
+  const source = String(text || "");
+  const m = /Files\/\.memory\/([^\s`"')\]}]+\.md)/i.exec(source);
+  return m?.[1]?.replace(/\\/g, "/").replace(/^\/+/, "") || "";
+}
+
+function stripMemoryPermissionClaimsFromReply(reply) {
   const base = String(reply || "").trim();
+  if (!base) return base;
+  return base
+    .split(/\n{2,}/)
+    .map((block) =>
+      block
+        .split(/\n/)
+        .filter((line) => {
+          const s = line.trim();
+          if (!s) return true;
+          if (/\bgeen\s+schrijfrecht(en)?\b.{0,160}\b(\.memory|memory|geheugen|long[-\s]?term)\b/i.test(s)) return false;
+          if (/\bhuidige\s+tooling\b.{0,180}\b(long[-\s]?term\s+memory|\.memory|memory|geheugen)\b.{0,180}\b(niet|geen)\b.{0,100}\b(aanpassen|bijwerken|toevoegen|schrijven|vastleggen)\b/i.test(s)) {
+            return false;
+          }
+          if (/\bkan\b.{0,80}\bniet\b.{0,80}\bzelf\b.{0,120}\b(\.memory|memory|geheugen|long[-\s]?term|toevoegen|bijschrijven)\b/i.test(s)) {
+            return false;
+          }
+          if (/\bbinnen deze sessie\b.{0,120}\bgeen\b.{0,80}\bschrijfrecht(en)?\b/i.test(s)) return false;
+          if (/\bvolgende sessie met schrijfrecht(en)?\b/i.test(s)) return false;
+          if (/\bzodra\b.{0,160}\b(memory[-\s]?(wijzigingen|schrijf[-\s]?tools?)|schrijfrecht(en)?|write[-\s]?tools?)\b.{0,160}\b(toegestaan|beschikbaar|weer)\b/i.test(s)) return false;
+          if (/\bhoort dit thuis in\b.{0,120}\bFiles\/\.memory\//i.test(s)) return false;
+          if (/\bje kunt\b.{0,160}\b(één-op-één|een-op-een|plakken|zelf toevoegen|zelf aanmaken)\b/i.test(s)) return false;
+          if (/\bik kan je wel\b.{0,160}\b(tekst|voorstel)\b.{0,80}\b(plakken|toevoegen)\b/i.test(s)) return false;
+          return true;
+        })
+        .join("\n")
+        .trim(),
+    )
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function stripMemoryHousekeepingFromReply(reply, actions = []) {
+  const base = stripMemoryPermissionClaimsFromReply(reply);
   if (!base || !Array.isArray(actions) || !actions.length) return base;
   const paths = actions
     .map((a) => String(a?.path || "").trim())
@@ -1168,9 +1491,9 @@ function looksLikeCorpusMemoryWriteRequest(message) {
   if (!text.trim()) return false;
   const writeIntent =
     /\b(werk|werkt)\s+(dit\s+)?(bij|in)\b/.test(text) ||
-    /\b(verwerk|vastleggen|leg vast|toevoegen|voeg toe|aanvullen|vul aan|bijwerken|update|maak aan)\b/.test(text) ||
+    /\b(verwerk|vastleggen|leg vast|toevoegen|voeg toe|aanvullen|vul aan|bijwerken|bijschrijven|schrijf bij|update|maak aan|neem op|opslaan|sla op|onthoud)\b/.test(text) ||
     /\b(statusregel|actiepunt|timestamp|dossier|geheugen|corpus|notitie)\b/.test(text);
-  const targetHint = /\b(dossier|document|bestand|notitie|corpus|geheugen|overzicht\.md|\.md)\b/.test(text);
+  const targetHint = /\b(dossier|document|bestand|notitie|corpus|geheugen|memory|long[-\s]?term|\.memory|overzicht\.md|\.md)\b/.test(text);
   return writeIntent && targetHint;
 }
 
@@ -1190,6 +1513,12 @@ function looksLikeDurableMemorySignal(message) {
     );
   const durableWorkSignal =
     /\b(standaard werkwijze|vaste aanpak|altijd|nooit|belangrijk voor mij|onthoud|moet je weten|voor later|structureel|terugkerend)\b/.test(
+      text,
+    ) ||
+    /\b(we|wij|jullie|organisatie|bedrijf|team|managed services|service management)\b.{0,140}\b(iso\s*27001|iso\s*9001|gecertificeerd|certificering|audit|compliance|informatiebeveiliging)\b/.test(
+      text,
+    ) ||
+    /\b(iso\s*27001|iso\s*9001|gecertificeerd|certificering)\b.{0,140}\b(kaders|processen|ingericht|managed services|sla|security|compliance|organisatie)\b/.test(
       text,
     );
   const tooEphemeral =
@@ -1452,6 +1781,7 @@ async function webSearchTavilyToolPayload(queryRaw, maxResultsRaw, runId) {
   );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), WEB_SEARCH_TIMEOUT_MS);
+  const t0 = Date.now();
   try {
     const response = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -1468,6 +1798,9 @@ async function webSearchTavilyToolPayload(queryRaw, maxResultsRaw, runId) {
       }),
       signal: controller.signal,
     });
+    const elapsedMs = Date.now() - t0;
+    performanceMetrics.llmCallCount += 1;
+    performanceMetrics.llmMs += elapsedMs;
     const bodyText = await response.text();
     if (!response.ok) {
       agentLog(runId, "web_search_http_error", {
@@ -1502,6 +1835,555 @@ async function webSearchTavilyToolPayload(queryRaw, maxResultsRaw, runId) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function confluenceConfigPayload() {
+  return {
+    configured: !!(CONFLUENCE_BASE_URL && CONFLUENCE_PAT),
+    baseUrl: CONFLUENCE_BASE_URL,
+    hasPat: !!CONFLUENCE_PAT,
+  };
+}
+
+function confluenceHeaders() {
+  return {
+    Authorization: `Bearer ${CONFLUENCE_PAT}`,
+    Accept: "application/json",
+  };
+}
+
+function confluencePageIdFromUrl(input) {
+  const raw = typeof input === "string" ? input.trim() : "";
+  if (!raw) return "";
+  if (/^\d+$/.test(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    const pageId = u.searchParams.get("pageId");
+    if (pageId && /^\d+$/.test(pageId)) return pageId;
+    const pathParts = u.pathname.split("/").filter(Boolean);
+    for (let i = 0; i < pathParts.length; i += 1) {
+      if ((pathParts[i] === "pages" || pathParts[i] === "content") && /^\d+$/.test(pathParts[i + 1] || "")) {
+        return pathParts[i + 1];
+      }
+    }
+    const numeric = pathParts.find((part) => /^\d{5,}$/.test(part));
+    return numeric || "";
+  } catch {
+    return "";
+  }
+}
+
+function decodeConfluenceDisplayPathPart(part) {
+  try {
+    return decodeURIComponent(String(part || "").replace(/\+/g, "%20")).trim();
+  } catch {
+    return String(part || "").replace(/\+/g, " ").trim();
+  }
+}
+
+function confluenceDisplayPageFromUrl(input) {
+  const raw = typeof input === "string" ? input.trim() : "";
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    const pathParts = u.pathname.split("/").filter(Boolean);
+    const displayIdx = pathParts.findIndex((part) => part.toLowerCase() === "display");
+    if (displayIdx < 0) return null;
+    const spaceKey = decodeConfluenceDisplayPathPart(pathParts[displayIdx + 1] || "");
+    const title = pathParts
+      .slice(displayIdx + 2)
+      .map(decodeConfluenceDisplayPathPart)
+      .join("/")
+      .trim();
+    if (!spaceKey || !title) return null;
+    return { spaceKey, title };
+  } catch {
+    return null;
+  }
+}
+
+function confluenceApiUrl(apiPath, params = {}) {
+  if (!/^https?:\/\//i.test(CONFLUENCE_BASE_URL)) {
+    throw new Error("CONFLUENCE_BASE_URL ontbreekt of is geen geldige http(s)-URL.");
+  }
+  const url = new URL(`${CONFLUENCE_BASE_URL}${apiPath.startsWith("/") ? apiPath : `/${apiPath}`}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null && String(value).trim()) url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+function confluenceAbsoluteUrl(link) {
+  const raw = typeof link === "string" ? link.trim() : "";
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return `${CONFLUENCE_BASE_URL.replace(/\/+$/, "")}/${raw.replace(/^\/+/, "")}`;
+}
+
+function confluenceCqlString(value) {
+  return String(value || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+}
+
+async function searchConfluencePayload({ query, spaceKey, limit } = {}, runId = "—") {
+  if (!CONFLUENCE_BASE_URL || !CONFLUENCE_PAT) {
+    return {
+      ok: false,
+      error:
+        "Confluence-config ontbreekt. Zet CONFLUENCE_BASE_URL en CONFLUENCE_PAT in markdown-viewer/.env of .env.local en herstart de server.",
+    };
+  }
+  const q = String(query || "").replace(/\s+/g, " ").trim();
+  if (!q) return { ok: false, error: "Zoekterm ontbreekt." };
+  const max = Math.min(50, Math.max(1, Number(limit || 10) || 10));
+  const space = String(spaceKey || "").trim();
+  const escaped = confluenceCqlString(q);
+  const parts = ["type = page", `(title ~ "${escaped}" OR text ~ "${escaped}")`];
+  if (space) parts.push(`space = "${confluenceCqlString(space)}"`);
+  const cql = `${parts.join(" AND ")} ORDER BY lastmodified DESC`;
+  const timeout = AbortSignal.timeout(CONFLUENCE_TIMEOUT_MS);
+  const apiUrl = confluenceApiUrl("/rest/api/content/search", {
+    cql,
+    limit: max,
+    expand: "space,version",
+  });
+  try {
+    const response = await fetch(apiUrl, { headers: confluenceHeaders(), signal: timeout });
+    const bodyText = await response.text();
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, error: `Confluence authenticatie mislukt (${response.status}). Controleer CONFLUENCE_PAT.` };
+    }
+    if (!response.ok) {
+      return { ok: false, error: await readConfluenceJsonError(new Response(bodyText, { status: response.status })) };
+    }
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      return { ok: false, error: "Confluence search response was geen JSON." };
+    }
+    const results = Array.isArray(data?.results)
+      ? data.results.map((item) => {
+          const webui = typeof item?._links?.webui === "string" ? item._links.webui : "";
+          const tinyui = typeof item?._links?.tinyui === "string" ? item._links.tinyui : "";
+          return {
+            id: String(item?.id || ""),
+            type: String(item?.type || ""),
+            status: String(item?.status || ""),
+            title: String(item?.title || ""),
+            space: {
+              key: String(item?.space?.key || ""),
+              name: String(item?.space?.name || ""),
+            },
+            version: {
+              number: typeof item?.version?.number === "number" ? item.version.number : null,
+              when: String(item?.version?.when || ""),
+              by: String(item?.version?.by?.displayName || item?.version?.by?.username || ""),
+            },
+            url: confluenceAbsoluteUrl(webui || tinyui),
+          };
+        })
+      : [];
+    agentLog(runId, "confluence_search", {
+      query: q,
+      spaceKey: space,
+      resultCount: results.length,
+    });
+    return {
+      ok: true,
+      query: q,
+      spaceKey: space,
+      cql,
+      limit: max,
+      size: typeof data?.size === "number" ? data.size : results.length,
+      results,
+    };
+  } catch (e) {
+    const aborted = e?.name === "TimeoutError" || e?.name === "AbortError";
+    return { ok: false, error: aborted ? "Confluence zoeken duurde te lang." : String(e?.message || e) };
+  }
+}
+
+function decodeHtmlEntities(s) {
+  return String(s || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_m, n) => {
+      const code = Number(n);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+    });
+}
+
+function confluenceStorageHtmlToText(html) {
+  return decodeHtmlEntities(
+    String(html || "")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|h[1-6]|li|tr|table|ul|ol|blockquote)>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n\s+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n"),
+  ).trim();
+}
+
+let confluenceTurndown = null;
+
+function confluenceNodeChildren(node) {
+  return Array.from(node?.children || node?.childNodes || []).filter((child) => child && child.nodeType === 1);
+}
+
+function confluenceTableRows(tableNode) {
+  if (typeof tableNode?.querySelectorAll === "function") {
+    return Array.from(tableNode.querySelectorAll("tr"));
+  }
+  const out = [];
+  const visit = (node) => {
+    for (const child of confluenceNodeChildren(node)) {
+      if (String(child.nodeName || "").toLowerCase() === "tr") out.push(child);
+      visit(child);
+    }
+  };
+  visit(tableNode);
+  return out;
+}
+
+function confluenceTableCells(rowNode) {
+  return confluenceNodeChildren(rowNode).filter((cell) => {
+    const n = String(cell.nodeName || "").toLowerCase();
+    return n === "td" || n === "th";
+  });
+}
+
+function confluenceTableCellText(cellNode) {
+  return decodeHtmlEntities(String(cellNode?.textContent || ""))
+    .replace(/\u00a0/g, " ")
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\|/g, "\\|")
+    .trim();
+}
+
+function confluenceTableToMarkdown(tableNode) {
+  const rows = confluenceTableRows(tableNode)
+    .map((row) => confluenceTableCells(row).map(confluenceTableCellText))
+    .filter((row) => row.length > 0);
+  if (!rows.length) return "";
+  const maxCols = Math.max(...rows.map((row) => row.length), 1);
+  const normalized = rows.map((row) => {
+    const padded = [...row];
+    while (padded.length < maxCols) padded.push("");
+    return padded;
+  });
+  const firstRow = confluenceTableRows(tableNode)[0];
+  const firstRowHasHeader = confluenceTableCells(firstRow).some(
+    (cell) => String(cell.nodeName || "").toLowerCase() === "th",
+  );
+  const header = firstRowHasHeader ? normalized[0] : normalized[0].map((_, idx) => (idx === 0 ? " " : `Kolom ${idx + 1}`));
+  const body = firstRowHasHeader ? normalized.slice(1) : normalized;
+  return [
+    `| ${header.join(" | ")} |`,
+    `| ${header.map(() => "---").join(" | ")} |`,
+    ...body.map((row) => `| ${row.join(" | ")} |`),
+  ].join("\n");
+}
+
+function htmlAttrEscape(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function htmlTextEscape(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function confluenceMacroPlaceholderFromNode(node) {
+  const name = node?.getAttribute?.("ac:name") || "confluence-macro";
+  const originalStorage = String(node?.outerHTML || "");
+  const encoded = Buffer.from(originalStorage, "utf8").toString("base64");
+  const preview = decodeHtmlEntities(String(node?.textContent || ""))
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+  return (
+    `\n\n<div class="mv-confluence-macro" data-confluence-macro-name="${htmlAttrEscape(name)}" ` +
+    `data-confluence-macro-b64="${encoded}" contenteditable="false">\n` +
+    `<strong>Confluence macro: ${htmlTextEscape(name)}</strong>\n` +
+    `<span>Dit blok is vergrendeld en wordt bij opslaan exact teruggezet in Confluence.</span>` +
+    (preview ? `\n<small>${htmlTextEscape(preview)}</small>` : "") +
+    `\n</div>\n\n`
+  );
+}
+
+function restoreConfluenceMacrosInStorageHtml(html) {
+  return String(html || "").replace(/<div\b[^>]*\bmv-confluence-macro\b[^>]*>[\s\S]*?<\/div>/gi, (block) => {
+    const m = block.match(/\bdata-confluence-macro-b64=(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i);
+    const encoded = m?.[1] || m?.[2] || m?.[3] || "";
+    if (!encoded) return block;
+    try {
+      return Buffer.from(encoded, "base64").toString("utf8");
+    } catch {
+      return block;
+    }
+  });
+}
+
+function confluenceStorageHtmlToMarkdown(html) {
+  if (!confluenceTurndown) {
+    confluenceTurndown = new TurndownService({
+      headingStyle: "atx",
+      hr: "---",
+      bulletListMarker: "-",
+      codeBlockStyle: "fenced",
+      emDelimiter: "*",
+      strongDelimiter: "**",
+      linkStyle: "inlined",
+    });
+    confluenceTurndown.addRule("confluenceTables", {
+      filter: "table",
+      replacement(_content, node) {
+        const md = confluenceTableToMarkdown(node);
+        return md ? `\n\n${md}\n\n` : "\n\n";
+      },
+    });
+    confluenceTurndown.addRule("confluenceStructuredMacro", {
+      filter(node) {
+        return typeof node?.nodeName === "string" && node.nodeName.toLowerCase() === "ac:structured-macro";
+      },
+      replacement(_content, node) {
+        return confluenceMacroPlaceholderFromNode(node);
+      },
+    });
+  }
+  return confluenceTurndown.turndown(String(html || "")).replace(/\u00a0/g, " ").trim();
+}
+
+function markdownToConfluenceStorageHtml(markdown) {
+  marked.setOptions({ gfm: true, breaks: false });
+  return restoreConfluenceMacrosInStorageHtml(marked.parse(String(markdown || ""), { async: false }));
+}
+
+async function readConfluenceJsonError(response) {
+  const text = await response.text().catch(() => "");
+  if (!text) return `Confluence request mislukt (${response.status}).`;
+  try {
+    const data = JSON.parse(text);
+    const msg = data?.message || data?.errorMessage || data?.error || text;
+    return `Confluence request mislukt (${response.status}): ${truncStr(String(msg), 500)}`;
+  } catch {
+    return `Confluence request mislukt (${response.status}): ${truncStr(text, 500)}`;
+  }
+}
+
+async function fetchConfluencePagePayload({ pageId, url, expand } = {}, runId = "—") {
+  if (!CONFLUENCE_BASE_URL || !CONFLUENCE_PAT) {
+    return {
+      ok: false,
+      error:
+        "Confluence-config ontbreekt. Zet CONFLUENCE_BASE_URL en CONFLUENCE_PAT in markdown-viewer/.env of .env.local en herstart de server.",
+    };
+  }
+  const id = String(pageId || "").trim() || confluencePageIdFromUrl(url);
+  const displayPage = id ? null : confluenceDisplayPageFromUrl(url);
+  const expandValue =
+    typeof expand === "string" && expand.trim()
+      ? expand.trim()
+      : "body.storage,version,space,ancestors,_links";
+  if ((!id || !/^\d+$/.test(id)) && !displayPage) {
+    return {
+      ok: false,
+      error:
+        "Geef een numerieke Confluence pageId, een URL waarin pageId voorkomt, of een /display/{spaceKey}/{paginatitel}-URL.",
+    };
+  }
+  const apiUrl = id
+    ? confluenceApiUrl(`/rest/api/content/${encodeURIComponent(id)}`, { expand: expandValue })
+    : confluenceApiUrl("/rest/api/content", {
+        spaceKey: displayPage.spaceKey,
+        title: displayPage.title,
+        type: "page",
+        expand: expandValue,
+      });
+  try {
+    const response = await fetch(apiUrl, {
+      headers: confluenceHeaders(),
+      signal: AbortSignal.timeout(CONFLUENCE_TIMEOUT_MS),
+    });
+    const bodyText = await response.text();
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, error: `Confluence authenticatie mislukt (${response.status}). Controleer CONFLUENCE_PAT.` };
+    }
+    if (!response.ok) {
+      return { ok: false, error: await readConfluenceJsonError(new Response(bodyText, { status: response.status })) };
+    }
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      return { ok: false, error: "Confluence response was geen JSON." };
+    }
+    if (!id) {
+      const results = Array.isArray(data?.results) ? data.results : [];
+      if (!results.length) {
+        return {
+          ok: false,
+          error: `Confluence-pagina niet gevonden voor space "${displayPage.spaceKey}" en titel "${displayPage.title}".`,
+        };
+      }
+      data = results[0];
+    }
+    const storageHtml = typeof data?.body?.storage?.value === "string" ? data.body.storage.value : "";
+    const text = confluenceStorageHtmlToText(storageHtml);
+    const markdown = confluenceStorageHtmlToMarkdown(storageHtml);
+    const webui = typeof data?._links?.webui === "string" ? data._links.webui : "";
+    const tinyui = typeof data?._links?.tinyui === "string" ? data._links.tinyui : "";
+    const pageUrl = webui
+      ? `${CONFLUENCE_BASE_URL}${webui.startsWith("/") ? webui : `/${webui}`}`
+      : tinyui
+        ? `${CONFLUENCE_BASE_URL}${tinyui.startsWith("/") ? tinyui : `/${tinyui}`}`
+        : "";
+    const payload = {
+      ok: true,
+      id: String(data?.id || id),
+      type: typeof data?.type === "string" ? data.type : "",
+      status: typeof data?.status === "string" ? data.status : "",
+      title: typeof data?.title === "string" ? data.title : "",
+      space: {
+        key: typeof data?.space?.key === "string" ? data.space.key : "",
+        name: typeof data?.space?.name === "string" ? data.space.name : "",
+      },
+      version: {
+        number: typeof data?.version?.number === "number" ? data.version.number : null,
+        when: typeof data?.version?.when === "string" ? data.version.when : "",
+        by: typeof data?.version?.by?.displayName === "string" ? data.version.by.displayName : "",
+      },
+      ancestors: Array.isArray(data?.ancestors)
+        ? data.ancestors.map((a) => ({ id: String(a?.id || ""), title: String(a?.title || "") })).filter((a) => a.id || a.title)
+        : [],
+      url: pageUrl,
+      storageHtml: truncStr(storageHtml, CONFLUENCE_PAGE_MAX_CHARS),
+      text: truncStr(text, CONFLUENCE_PAGE_MAX_CHARS),
+      markdown: truncStr(markdown, CONFLUENCE_PAGE_MAX_CHARS),
+      truncated:
+        storageHtml.length > CONFLUENCE_PAGE_MAX_CHARS ||
+        text.length > CONFLUENCE_PAGE_MAX_CHARS ||
+        markdown.length > CONFLUENCE_PAGE_MAX_CHARS,
+    };
+    agentLog(runId, "confluence_page_fetch", {
+      pageId: payload.id,
+      title: truncStr(payload.title, 240),
+      chars: payload.text.length,
+      truncated: payload.truncated,
+    });
+    return payload;
+  } catch (e) {
+    const aborted = e?.name === "AbortError" || e?.name === "TimeoutError";
+    return {
+      ok: false,
+      error: aborted ? "Confluence ophalen duurde te lang." : String(e?.message || e),
+    };
+  }
+}
+
+async function updateConfluencePageFromMarkdown({ pageId, title, baseVersion, markdown } = {}, runId = "—") {
+  if (!CONFLUENCE_BASE_URL || !CONFLUENCE_PAT) {
+    return {
+      ok: false,
+      error:
+        "Confluence-config ontbreekt. Zet CONFLUENCE_BASE_URL en CONFLUENCE_PAT in markdown-viewer/.env of .env.local en herstart de server.",
+    };
+  }
+  const id = String(pageId || "").trim();
+  if (!id || !/^\d+$/.test(id)) {
+    return { ok: false, error: "Numerieke Confluence pageId ontbreekt." };
+  }
+  if (typeof markdown !== "string") {
+    return { ok: false, error: "Markdown-inhoud ontbreekt." };
+  }
+
+  const latest = await fetchConfluencePagePayload({ pageId: id, expand: "version,space,_links" }, runId);
+  if (!latest.ok) return latest;
+  const latestVersion = Number(latest.version?.number || 0);
+  const expectedVersion = Number(baseVersion || 0);
+  if (expectedVersion > 0 && latestVersion > 0 && latestVersion !== expectedVersion) {
+    return {
+      ok: false,
+      conflict: true,
+      error: `Confluence-pagina is intussen gewijzigd. Lokale basisversie ${expectedVersion}, actuele versie ${latestVersion}. Importeer opnieuw voordat je opslaat.`,
+      currentVersion: latestVersion,
+    };
+  }
+
+  const nextVersion = Math.max(latestVersion, expectedVersion) + 1;
+  const pageTitle = typeof title === "string" && title.trim() ? title.trim() : latest.title || `Confluence ${id}`;
+  const apiUrl = confluenceApiUrl(`/rest/api/content/${encodeURIComponent(id)}`);
+  const response = await fetch(apiUrl, {
+    method: "PUT",
+    headers: {
+      ...confluenceHeaders(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      id,
+      type: "page",
+      title: pageTitle,
+      version: { number: nextVersion },
+      body: {
+        storage: {
+          value: markdownToConfluenceStorageHtml(markdown),
+          representation: "storage",
+        },
+      },
+    }),
+    signal: AbortSignal.timeout(CONFLUENCE_TIMEOUT_MS),
+  });
+  const bodyText = await response.text();
+  if (response.status === 401 || response.status === 403) {
+    return { ok: false, error: `Confluence authenticatie mislukt (${response.status}). Controleer CONFLUENCE_PAT.` };
+  }
+  if (response.status === 409) {
+    return {
+      ok: false,
+      conflict: true,
+      error: "Confluence weigerde opslaan door een versieconflict. Importeer opnieuw en probeer daarna opnieuw.",
+    };
+  }
+  if (!response.ok) {
+    return { ok: false, error: await readConfluenceJsonError(new Response(bodyText, { status: response.status })) };
+  }
+  let data = {};
+  try {
+    data = JSON.parse(bodyText);
+  } catch {
+    data = {};
+  }
+  const savedVersion = typeof data?.version?.number === "number" ? data.version.number : nextVersion;
+  agentLog(runId, "confluence_page_update", {
+    pageId: id,
+    title: truncStr(pageTitle, 240),
+    version: savedVersion,
+    markdownChars: markdown.length,
+  });
+  return {
+    ok: true,
+    id,
+    title: pageTitle,
+    version: savedVersion,
+    url: latest.url || "",
+  };
 }
 
 /** Normaliseert viewer-hints uit LLM JSON voor de markdown-viewer (open/highlight). */
@@ -1621,6 +2503,146 @@ function writeAgentConfig(input) {
   const config = { apiKey, endpoint, model };
   fs.writeFileSync(AGENT_CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
   return config;
+}
+
+function defaultPromptMacros() {
+  return [
+    {
+      id: "meeting-report",
+      name: "Gespreksverslag",
+      description: "Maak een gespreksverslag op basis van een transcript en plaats dit in het document.",
+      mode: "agent",
+      prompt:
+        "Maak op basis van onderstaand transcript een gespreksverslag en plaats dit in het huidige Markdown-document.\n\n" +
+        "Vereisten:\n" +
+        "- Begin met een korte samenvatting.\n" +
+        "- Maak een kopje per besproken onderwerp.\n" +
+        "- Leg duidelijke afspraken en acties vast, inclusief eigenaar/personen en data.\n" +
+        "- Formuleer acties zo SMART mogelijk: Specifiek, Meetbaar, Aanwijsbaar, Realistisch en Tijdsgebonden.\n" +
+        "- Gebruik Markdown die past bij de stijl van het huidige document.\n" +
+        "- Herhaal het transcript niet letterlijk; verwerk alleen de relevante inhoud in het verslag.\n" +
+        "- Voeg het verslag logisch in het document in. Vervang bestaande inhoud alleen als dat duidelijk de bedoeling is.",
+      requiresContent: true,
+      contentLabel: "Transcript",
+      contentPlaceholder: "Plak hier het transcript van het gesprek...",
+      contentPrefix: "Transcript:",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    {
+      id: "cleanup-markdown-page",
+      name: "Markdown pagina opschonen",
+      description: "Laat de Agent de geopende Markdown-pagina redactioneel en structureel opschonen.",
+      mode: "agent",
+      prompt:
+        "Schoon de geopende Markdown-pagina op.\n\n" +
+        "Verbeter structuur, koppen, formulering, consistentie, opsommingen en leesbaarheid. " +
+        "Behoud de inhoudelijke betekenis. Verwijder dubbele of rommelige tekst, maar laat relevante details staan. " +
+        "Gebruik Markdown die past bij de bestaande stijl van het document.",
+      requiresContent: false,
+      contentLabel: "Aanvullende instructie",
+      contentPlaceholder: "Optioneel: voeg specifieke aandachtspunten toe...",
+      contentPrefix: "Aanvullende instructie:",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  ];
+}
+
+function normalizePromptMacro(raw, fallback = {}) {
+  if (!raw || typeof raw !== "object") return null;
+  const now = new Date().toISOString();
+  const idRaw = typeof raw.id === "string" ? raw.id.trim() : "";
+  const name = typeof raw.name === "string" ? raw.name.trim().slice(0, 120) : "";
+  const prompt = typeof raw.prompt === "string" ? raw.prompt.trim() : "";
+  if (!name || !prompt) return null;
+  const id =
+    idRaw && /^[a-zA-Z0-9][a-zA-Z0-9_-]{1,80}$/.test(idRaw)
+      ? idRaw
+      : typeof fallback.id === "string" && fallback.id
+        ? fallback.id
+        : crypto.randomUUID();
+  const createdAt =
+    typeof raw.createdAt === "string" && raw.createdAt.trim()
+      ? raw.createdAt.trim()
+      : typeof fallback.createdAt === "string" && fallback.createdAt
+        ? fallback.createdAt
+        : now;
+  return {
+    id,
+    name,
+    description: typeof raw.description === "string" ? raw.description.trim().slice(0, 1000) : "",
+    mode: raw.mode === "ask" ? "ask" : "agent",
+    prompt: prompt.slice(0, 20000),
+    requiresContent: raw.requiresContent === true,
+    contentLabel:
+      typeof raw.contentLabel === "string" && raw.contentLabel.trim()
+        ? raw.contentLabel.trim().slice(0, 120)
+        : "Aanvullende inhoud",
+    contentPlaceholder:
+      typeof raw.contentPlaceholder === "string" ? raw.contentPlaceholder.trim().slice(0, 1000) : "",
+    contentPrefix:
+      typeof raw.contentPrefix === "string" && raw.contentPrefix.trim()
+        ? raw.contentPrefix.trim().slice(0, 120)
+        : "Aanvullende inhoud:",
+    createdAt,
+    updatedAt: now,
+  };
+}
+
+function readPromptMacrosPayload() {
+  if (!fs.existsSync(PROMPT_MACROS_PATH)) {
+    const payload = { version: 1, macros: defaultPromptMacros() };
+    ensureParentDir(PROMPT_MACROS_PATH);
+    fs.writeFileSync(PROMPT_MACROS_PATH, JSON.stringify(payload, null, 2), "utf8");
+    return payload;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(PROMPT_MACROS_PATH, "utf8"));
+    const rawMacros = Array.isArray(data?.macros) ? data.macros : [];
+    const macros = rawMacros.map((m) => normalizePromptMacro(m, m)).filter(Boolean);
+    return { version: 1, macros };
+  } catch {
+    return { version: 1, macros: defaultPromptMacros() };
+  }
+}
+
+function writePromptMacrosPayload(payload) {
+  const macros = Array.isArray(payload?.macros)
+    ? payload.macros.map((m) => normalizePromptMacro(m, m)).filter(Boolean)
+    : [];
+  const next = { version: 1, macros };
+  ensureParentDir(PROMPT_MACROS_PATH);
+  fs.writeFileSync(PROMPT_MACROS_PATH, JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+
+function createPromptMacro(input) {
+  const payload = readPromptMacrosPayload();
+  const macro = normalizePromptMacro({ ...input, id: crypto.randomUUID() });
+  if (!macro) throw new Error("Macro heeft minimaal een naam en prompt nodig.");
+  payload.macros.push(macro);
+  return writePromptMacrosPayload(payload);
+}
+
+function updatePromptMacro(idRaw, input) {
+  const id = String(idRaw || "").trim();
+  const payload = readPromptMacrosPayload();
+  const idx = payload.macros.findIndex((m) => m.id === id);
+  if (idx < 0) throw new Error("Macro niet gevonden.");
+  const merged = { ...payload.macros[idx], ...input, id, createdAt: payload.macros[idx].createdAt };
+  const macro = normalizePromptMacro(merged, payload.macros[idx]);
+  if (!macro) throw new Error("Macro heeft minimaal een naam en prompt nodig.");
+  payload.macros[idx] = macro;
+  return writePromptMacrosPayload(payload);
+}
+
+function deletePromptMacro(idRaw) {
+  const id = String(idRaw || "").trim();
+  const payload = readPromptMacrosPayload();
+  const next = payload.macros.filter((m) => m.id !== id);
+  if (next.length === payload.macros.length) throw new Error("Macro niet gevonden.");
+  return writePromptMacrosPayload({ ...payload, macros: next });
 }
 
 function markdownChatCompletionsUrl(endpoint) {
@@ -2417,6 +3439,93 @@ function parseAgentJsonResponse(text) {
   throw new Error("LLM-response is geen geldige JSON");
 }
 
+function normalizeParsedAgentJsonResponse(parsed) {
+  let current = parsed;
+  for (let i = 0; i < 2; i++) {
+    if (typeof current !== "string") break;
+    const trimmed = current.trim();
+    if (!trimmed) break;
+    try {
+      current = parseAgentJsonResponse(trimmed);
+    } catch {
+      break;
+    }
+  }
+  return current;
+}
+
+function replyStringFromParsedAgentResponse(parsed) {
+  let reply = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+  for (let i = 0; i < 2; i++) {
+    if (!reply.startsWith("{")) break;
+    try {
+      const nested = normalizeParsedAgentJsonResponse(parseAgentJsonResponse(reply));
+      const nestedReply = typeof nested?.reply === "string" ? nested.reply.trim() : "";
+      if (!nestedReply || nestedReply === reply) break;
+      reply = nestedReply;
+    } catch {
+      break;
+    }
+  }
+  return reply;
+}
+
+function decodeJsonLikeString(raw) {
+  try {
+    return JSON.parse(`"${String(raw).replace(/\r/g, "\\r").replace(/\n/g, "\\n")}"`);
+  } catch {
+    return String(raw)
+      .replace(/\\"/g, '"')
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t")
+      .replace(/\\\\/g, "\\");
+  }
+}
+
+function extractJsonLikeStringField(text, fieldName) {
+  const source = String(text || "");
+  const re = new RegExp(`"${fieldName}"\\s*:\\s*"`, "g");
+  const match = re.exec(source);
+  if (!match) return "";
+  let raw = "";
+  for (let i = match.index + match[0].length; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      raw += ch;
+      if (i + 1 < source.length) {
+        raw += source[i + 1];
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '"') return decodeJsonLikeString(raw).trim();
+    raw += ch;
+  }
+  return "";
+}
+
+function stripJsonLikeEnvelopeFromText(text) {
+  const source = String(text || "").trim();
+  if (!source) return "";
+  const idx = source.search(/\{\s*"(reply|changes|viewerActions|pendingMemoryActions)"/);
+  if (idx > 0) return source.slice(0, idx).trim();
+  return source;
+}
+
+function recoverUserFacingReplyFromMixedContent(text) {
+  const source = String(text || "").trim();
+  if (!source) return "";
+  try {
+    return replyStringFromParsedAgentResponse(normalizeParsedAgentJsonResponse(parseAgentJsonResponse(source)));
+  } catch {
+    /* Mixed prose + malformed JSON-like content is handled below. */
+  }
+  const fieldReply = extractJsonLikeStringField(source, "reply");
+  if (fieldReply) return fieldReply;
+  return stripJsonLikeEnvelopeFromText(source);
+}
+
 /**
  * Chat Completions `message.content` is meestal een string; sommige gateways geven multimodal arrays of null.
  */
@@ -2602,7 +3711,7 @@ function buildAgentHistoryAssistantSummary(parsed, errorText) {
     return `Geen wijziging toegepast: ${errorText}`;
   }
   const changes = Array.isArray(parsed?.changes) ? parsed.changes : [];
-  const reply = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+  const reply = replyStringFromParsedAgentResponse(parsed);
   const base = reply || "(geen reply-tekst)";
   return changes.length ? `${base}\n[${changes.length} patch(es) toegepast]` : base;
 }
@@ -2817,9 +3926,9 @@ async function callReviewAgent(
   }
 
   try {
-    const parsed = parseAgentJsonResponse(contentStr);
+    const parsed = normalizeParsedAgentJsonResponse(parseAgentJsonResponse(contentStr));
     const changes = Array.isArray(parsed?.changes) ? parsed.changes : [];
-    const replyStr = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+    const replyStr = replyStringFromParsedAgentResponse(parsed);
     if (changes.length === 0 && !replyStr) {
       noteLlmProseFallback(llmDebugOut);
       agentLog(runId, "llm_json_shape_prose_fallback", {
@@ -2828,7 +3937,7 @@ async function callReviewAgent(
         agentKind: kind,
         proseChars: contentStr.length,
       });
-      return { changes: [], reply: contentStr };
+      return { changes: [], reply: recoverUserFacingReplyFromMixedContent(contentStr) };
     }
     agentLog(runId, "llm_parse_ok", {
       step,
@@ -2836,7 +3945,7 @@ async function callReviewAgent(
       changesCount: changes.length,
       replyChars: replyStr.length,
     });
-    return parsed;
+    return { ...parsed, reply: replyStr };
   } catch (e) {
     if (contentStr) {
       noteLlmProseFallback(llmDebugOut);
@@ -2847,7 +3956,7 @@ async function callReviewAgent(
         parseError: String(e?.message || e),
         proseChars: contentStr.length,
       });
-      return { changes: [], reply: contentStr };
+      return { changes: [], reply: recoverUserFacingReplyFromMixedContent(contentStr) };
     }
     if (llmDebugOut && typeof llmDebugOut === "object") {
       llmDebugOut.contentParseError = String(e?.message || e);
@@ -2895,8 +4004,66 @@ const CORPUS_MARKDOWN_TOOLS = [
             type: "string",
             description: "Korte reden voor jezelf / voor het activiteitenlog.",
           },
+          query: {
+            type: "string",
+            description:
+              "Optionele zoekvraag om de secties binnen dit document met BM25 te rangschikken. Gebruik meestal de kern van de gebruikersvraag.",
+          },
         },
         required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_corpus_outline",
+      description:
+        "Lees tokenzuinig de meest relevante koppen/subkoppen en korte previews van één werkdocument uit Files/. Gebruik dit vóór read_corpus_section wanneer je gericht informatie zoekt.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relatief pad naar het .md-bestand onder Files/.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+          query: {
+            type: "string",
+            description:
+              "Optionele zoekvraag om de secties binnen dit memory-document met BM25 te rangschikken. Gebruik meestal de kern van de gebruikersvraag.",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_corpus_section",
+      description:
+        "Lees alleen de inhoud van één gekozen sectie uit een werkdocument. Gebruik index, id, heading of headingPath uit read_corpus_outline.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relatief pad naar het .md-bestand onder Files/.",
+          },
+          section: {
+            type: "string",
+            description: "Sectie-index, id, heading of headingPath zoals teruggegeven door read_corpus_outline.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+        },
+        required: ["path", "section"],
       },
     },
   },
@@ -2919,6 +4086,54 @@ const CORPUS_MARKDOWN_TOOLS = [
           },
         },
         required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_memory_outline",
+      description:
+        "Lees tokenzuinig de meest relevante koppen/subkoppen en korte previews van één long-term-memory document uit Files/.memory/. Gebruik dit vóór read_memory_section wanneer je gericht informatie zoekt.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relatief pad naar het .md-bestand onder Files/.memory/.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_memory_section",
+      description:
+        "Lees alleen de inhoud van één gekozen sectie uit een long-term-memory document. Gebruik index, id, heading of headingPath uit read_memory_outline.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relatief pad naar het .md-bestand onder Files/.memory/.",
+          },
+          section: {
+            type: "string",
+            description: "Sectie-index, id, heading of headingPath zoals teruggegeven door read_memory_outline.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+        },
+        required: ["path", "section"],
       },
     },
   },
@@ -3068,6 +4283,64 @@ const WEB_SEARCH_TOOLS = [
   },
 ];
 
+const CONFLUENCE_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "search_confluence",
+      description:
+        "Doorzoek Confluence via de server-side Personal Access Token. Gebruik dit wanneer de gebruiker vraagt naar Confluence-inhoud zonder pageId/URL, wanneer je eerst een relevante Confluence-pagina moet vinden, of wanneer de opdracht duidelijk aanleiding geeft om Confluence als bron te raadplegen.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Concrete zoekterm voor Confluence, bijvoorbeeld een paginatitel, onderwerp, klantnaam of procesnaam.",
+          },
+          spaceKey: {
+            type: "string",
+            description: "Optionele Confluence space key om de zoekopdracht te beperken.",
+          },
+          limit: {
+            type: "number",
+            description: "Maximaal aantal resultaten (1-50). Gebruik meestal 5-10.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_confluence_page",
+      description:
+        "Haal één Confluence-pagina op via de server-side Personal Access Token. Gebruik dit wanneer de gebruiker een Confluence pageId, /pages/...-URL of /display/{spaceKey}/{title}-URL geeft, of expliciet vraagt om Confluence-inhoud te lezen.",
+      parameters: {
+        type: "object",
+        properties: {
+          pageId: {
+            type: "string",
+            description: "Numerieke Confluence pageId. Mag leeg blijven als url een pageId bevat.",
+          },
+          url: {
+            type: "string",
+            description: "Confluence-pagina-URL. Ondersteunt URLs met pageId en /display/{spaceKey}/{paginatitel}.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor jezelf / voor het activiteitenlog.",
+          },
+        },
+      },
+    },
+  },
+];
+
 const ACTIVITY_LOG_TOOLS = [
   {
     type: "function",
@@ -3104,11 +4377,20 @@ const ACTIVITY_LOG_TOOLS = [
   },
 ];
 
+const MEMORY_WRITE_TOOL_NAMES = new Set(["create_corpus_markdown", "update_corpus_markdown", "suggest_corpus_deletion"]);
+
 function askToolsForOptions(opts = {}) {
   const tools = [];
-  if (opts.enableCorpusTools) tools.push(...CORPUS_MARKDOWN_TOOLS);
+  if (opts.enableCorpusTools) {
+    tools.push(
+      ...CORPUS_MARKDOWN_TOOLS.filter(
+        (tool) => opts.enableMemoryWriteTools === true || !MEMORY_WRITE_TOOL_NAMES.has(tool?.function?.name),
+      ),
+    );
+  }
   if (opts.enableActivityLogs) tools.push(...ACTIVITY_LOG_TOOLS);
   if (opts.enableWebSearch) tools.push(...WEB_SEARCH_TOOLS);
+  if (opts.enableConfluence) tools.push(...CONFLUENCE_TOOLS);
   return tools;
 }
 
@@ -3129,13 +4411,31 @@ async function callCorpusAskAgentWithTools(
   const enableCorpusTools = corpusOpts.enableCorpusTools !== false;
   const enableWebSearch = corpusOpts.enableWebSearch === true;
   const enableActivityLogs = corpusOpts.enableActivityLogs === true;
+  const enableConfluence = corpusOpts.enableConfluence === true;
   const enableMemoryWriteTools = corpusOpts.enableMemoryWriteTools === true;
-  const tools = askToolsForOptions({ enableCorpusTools, enableWebSearch, enableActivityLogs, enableMemoryWriteTools });
+  const tools = askToolsForOptions({
+    enableCorpusTools,
+    enableWebSearch,
+    enableActivityLogs,
+    enableConfluence,
+    enableMemoryWriteTools,
+  });
   const runId = logMeta.runId ?? "—";
   const activities = [];
   const corpusCreatedPaths = [];
   const executedMemoryActions = [];
   const pendingMemoryActions = [];
+  const performanceMetrics = {
+    startedAt: Date.now(),
+    contextChars: String(bootstrapUserMarkdown || "").length,
+    retrievalMeta: corpusOpts.retrievalMeta || null,
+    llmCallCount: 0,
+    llmMs: 0,
+    tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    toolCallCount: 0,
+    retrievedChars: 0,
+    replyChars: 0,
+  };
 
   const pushActivity = (row) => {
     const payload = { type: "activity", ts: Date.now(), ...row };
@@ -3161,16 +4461,17 @@ async function callCorpusAskAgentWithTools(
   const systemContent =
     "Je bent een assistent voor een persoonlijke Markdown-werkomgeving met drie lagen: werkdocumenten, actieve chat als short-term memory, en Files/.memory/ als long-term memory. Beantwoord uiteindelijk in het Nederlands, helder en waarheidsgetrouw. " +
     (enableCorpusTools
-      ? "Je hebt read-only retrieval tools voor werkdocumenten en long-term memory: read_corpus_markdown en read_memory_markdown. " +
+      ? "Je hebt read-only retrieval tools voor werkdocumenten en long-term memory: read_corpus_outline, read_corpus_section, read_corpus_markdown, read_memory_outline, read_memory_section en read_memory_markdown. " +
         (enableMemoryWriteTools
           ? "Je hebt daarnaast memory-write tools create_corpus_markdown, update_corpus_markdown en suggest_corpus_deletion. "
           : "Je hebt in deze call geen memory-write tools; beantwoord de vraag zonder geheugenmutaties. ") +
-        "Corpus Ask betekent dat je werkdocumenten en long-term memory als twee gescheiden zoekruimtes gebruikt: scan beide compacte lijsten in het user-bericht en beperk je niet tot de hintsecties. " +
-        "Gebruik read_corpus_markdown voor relevante werkdocumenten en read_memory_markdown voor relevante memory-bestanden voordat je specifieke feiten of citaten geeft. " +
+        "Corpus Ask betekent dat je werkdocumenten en long-term memory als twee gescheiden zoekruimtes gebruikt: start bij de compacte BM25-routekaarten in het user-bericht en schaal alleen op met tools als je meer bewijs nodig hebt. " +
+        "Gebruik bij gerichte vragen eerst read_corpus_outline/read_memory_outline met een korte query op basis van de gebruikersvraag; de server rangschikt secties dan met BM25. Lees daarna met read_corpus_section/read_memory_section alleen de gekozen kop of subkop. " +
+        "Gebruik read_corpus_markdown/read_memory_markdown vooral bij kleine of ongestructureerde documenten, of wanneer je echt het volledige bestand nodig hebt. " +
         "Bij brede vragen (overzicht, inventarisatie, vergelijking, alles/hele corpus) lees je meerdere relevante bestanden in rondes totdat de context voldoende is afgedekt. " +
         "Als de compacte index voldoende is voor een oriënterend antwoord, mag je meteen antwoorden zonder extra volledige bestanden te lezen. " +
         (enableMemoryWriteTools
-          ? "Ga autonoom met long-term memory om: werk bestaande memory-documenten bij wanneer nieuwe duurzame context daar logisch thuishoort, of maak zelfstandig nieuwe memory-documenten aan als er structureel over onderwerpen/personen/klanten/voorkeuren/werkwijzen wordt gesproken en er geen passend memory-document bestaat. Vraag de gebruiker niet of een onderwerp een eigen document nodig heeft; beslis dat zelf. Belangrijk: geheugenacties die je via create_corpus_markdown of update_corpus_markdown aanvraagt worden direct door de server uitgevoerd als interne agent-housekeeping. Geef geen aparte melding dat memory is bijgewerkt en vraag geen akkoord. Noem in je reply geen storage-beslissingen, bestandsnamen, memory-paden of housekeeping-acties zoals aanmaken, bijwerken, opslaan of vastleggen, tenzij de gebruiker expliciet vraagt waar iets staat of om een audit/inspectie van memory. Voer waar nodig meerdere memory-mutaties uit binnen één promptverwerking. Gebruik create_corpus_markdown alleen als er geen geschikt bestaand memory-document is; gebruik update_corpus_markdown alleen na lezen van het memory-doelbestand en met exacte find/replace. Documenten verwijderen is verboden: gebruik alleen suggest_corpus_deletion. "
+          ? "Ga autonoom met long-term memory om: werk bestaande memory-documenten bij wanneer nieuwe duurzame context daar logisch thuishoort, of maak zelfstandig nieuwe memory-documenten aan als er structureel over onderwerpen/personen/klanten/voorkeuren/werkwijzen wordt gesproken en er geen passend memory-document bestaat. Vraag de gebruiker niet of een onderwerp een eigen document nodig heeft; beslis dat zelf. Belangrijk: geheugenacties die je via create_corpus_markdown of update_corpus_markdown aanvraagt worden direct door de server uitgevoerd als interne agent-housekeeping. Zeg nooit dat je geen schrijfrechten op Files/.memory/ hebt wanneer deze memory-write tools beschikbaar zijn; gebruik dan de tool of pendingMemoryActions. Geef geen aparte melding dat memory is bijgewerkt en vraag geen akkoord. Noem in je reply geen storage-beslissingen, bestandsnamen, memory-paden of housekeeping-acties zoals aanmaken, bijwerken, opslaan of vastleggen, tenzij de gebruiker expliciet vraagt waar iets staat of om een audit/inspectie van memory. Voer waar nodig meerdere memory-mutaties uit binnen één promptverwerking. Gebruik create_corpus_markdown alleen als er geen geschikt bestaand memory-document is; gebruik update_corpus_markdown alleen na lezen van het memory-doelbestand en met exacte find/replace. Documenten verwijderen is verboden: gebruik alleen suggest_corpus_deletion. "
           : "")
       : "De user-context bevat het huidige document als referentie; je hebt geen tool om lokale bestanden te lezen. ") +
     ASK_CURIOSITY_RULE +
@@ -3180,12 +4481,16 @@ async function callCorpusAskAgentWithTools(
     (enableActivityLogs
       ? "Je hebt ook tool **read_activity_logs** om persistente Ask/Agent activity logs te lezen. Gebruik deze tool wanneer de gebruiker vraagt naar activiteiten, urenregistratie, timesheets, werkzaamheden of wat er op een dag/week is gedaan. Activity logs zijn read-only en geen Markdown-documenten. "
       : "") +
+    (enableConfluence
+      ? "Je hebt ook Confluence-tools met de geconfigureerde server-side PAT: **search_confluence** om pagina's te vinden en **read_confluence_page** om een gevonden of opgegeven pagina op te halen. Gebruik search_confluence wanneer de gebruiker vraagt naar Confluence-inhoud zonder pageId/URL, wanneer de opdracht duidelijk aanleiding geeft om Confluence als bron te raadplegen, of wanneer je eerst relevante Confluence-pagina's moet vinden. Gebruik daarna read_confluence_page voor de meest relevante zoekresultaten voordat je inhoudelijke conclusies trekt. Noem de Confluence-pagina-URL als bron wanneer je inhoud uit Confluence gebruikt. "
+      : "") +
     (enableCorpusTools
       ? "Het eerste user-bericht bevat gescheiden index-/overzichtsblokken voor werkdocumenten en long-term memory zonder volledige documentteksten. "
       : "Het eerste user-bericht bevat de gebruikersvraag en eventueel het huidige Markdown-document. ") +
     (enableMemoryWriteTools
-      ? "Als de gebruiker vraagt iets vast te leggen, bij te werken, aan te maken of in het geheugen/corpus te verwerken, of als je antwoord duurzame stappen/kennis bevat die later terugvindbaar moeten zijn, MOET je zelf kiezen tussen één of meerdere create_corpus_markdown- en update_corpus_markdown-acties voor Files/.memory/. Vraag niet of de gebruiker dat wil; voer de passende geheugenacties uit. Als je geen toolcall gebruikt, neem dan top-level \"pendingMemoryActions\" op in je finale JSON met één of meerdere acties met dezelfde velden (kind, path, reason, content of find/replace, sources), waarbij path relatief is aan Files/.memory/. De reply blijft inhoudelijk: geen melding over uitgevoerde of gekozen memory-acties, geen paden en geen 'ik heb dit aangemaakt/bijgewerkt'. "
+      ? "Als de gebruiker vraagt iets vast te leggen, bij te werken, aan te maken of in het geheugen/corpus te verwerken, of als je antwoord duurzame stappen/kennis bevat die later terugvindbaar moeten zijn, MOET je zelf kiezen tussen één of meerdere create_corpus_markdown- en update_corpus_markdown-acties voor Files/.memory/. Vraag niet of de gebruiker dat wil; voer de passende geheugenacties uit. Als je geen toolcall gebruikt, neem dan top-level \"pendingMemoryActions\" op in je finale JSON met één of meerdere acties met dezelfde velden (kind, path, reason, content of find/replace, sources), waarbij path relatief is aan Files/.memory/. Zeg niet dat je geen schrijfrechten hebt: de server verwerkt deze memory-actions namens jou. De reply blijft inhoudelijk: geen melding over uitgevoerde of gekozen memory-acties, geen paden en geen 'ik heb dit aangemaakt/bijgewerkt'. "
       : "") +
+    "Antwoordstijl: schrijf compact, zakelijk en rustig. Gebruik geen emoji's, geen overmatige horizontale lijnen, geen tabellen tenzij de gebruiker daarom vraagt, en maximaal één inhoudelijke vervolgvraag als die echt waarde toevoegt. " +
     "Na het lezen van alle relevante bestanden: geef het uiteindelijke antwoord als **uitsluitend** één JSON-object met sleutel \"reply\" (string, verplicht). " +
     "Optioneel mag je ook \"viewerActions\" opnemen: een array (max 10) met hints voor de viewer — alleen als het de gebruiker helpt je antwoord te volgen: " +
     "{\"openMarkdown\":\"pad/onder/map.md\"} opent dat bestand links; {\"highlight\":{\"path\":\"pad/map.md\",\"snippet\":\"exact fragment zoals in het bronbestand\"}} markeert dat fragment na openen (snippet moet letterlijk voorkomen). " +
@@ -3256,10 +4561,12 @@ async function callCorpusAskAgentWithTools(
     }
 
     attachOpenAiChoiceDebug(llmDebugOut, data, choice);
+    addTokenUsage(performanceMetrics.tokenUsage, normalizeTokenUsage(data?.usage));
 
     messages.push(msg);
 
     const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+    performanceMetrics.toolCallCount += toolCalls.length;
 
     if (toolCalls.length > 0) {
       const fnNames = toolCalls
@@ -3267,17 +4574,29 @@ async function callCorpusAskAgentWithTools(
         .filter(Boolean);
       const hasRead = fnNames.includes("read_corpus_markdown");
       const hasReadMemory = fnNames.includes("read_memory_markdown");
+      const hasReadOutline = fnNames.includes("read_corpus_outline") || fnNames.includes("read_memory_outline");
+      const hasReadSection = fnNames.includes("read_corpus_section") || fnNames.includes("read_memory_section");
       const hasCreate = fnNames.includes("create_corpus_markdown");
       const hasUpdate = fnNames.includes("update_corpus_markdown");
       const hasSuggestDelete = fnNames.includes("suggest_corpus_deletion");
       const hasWebSearch = fnNames.includes("web_search");
       const hasActivityLogs = fnNames.includes("read_activity_logs");
+      const hasConfluenceSearch = fnNames.includes("search_confluence");
+      const hasConfluence = fnNames.includes("read_confluence_page") || hasConfluenceSearch;
       let fetchLabel = `${toolCalls.length} corpus-actie(s)…`;
-      if (hasActivityLogs) fetchLabel = `${toolCalls.length} activity-logactie(s)…`;
-      else if (hasWebSearch && (hasRead || hasCreate)) fetchLabel = `${toolCalls.length} corpus-/webactie(s)…`;
+      if (hasConfluenceSearch && fnNames.includes("read_confluence_page")) {
+        fetchLabel = `${toolCalls.length} Confluence-zoek-/leesactie(s)…`;
+      } else if (hasConfluenceSearch) fetchLabel = `${toolCalls.length} Confluence-zoekopdracht(en)…`;
+      else if (hasConfluence) fetchLabel = `${toolCalls.length} Confluence-pagina('s) ophalen…`;
+      else if (hasActivityLogs) fetchLabel = `${toolCalls.length} activity-logactie(s)…`;
+      else if (hasWebSearch && (hasRead || hasReadMemory || hasReadOutline || hasReadSection || hasCreate)) {
+        fetchLabel = `${toolCalls.length} corpus-/webactie(s)…`;
+      }
       else if (hasWebSearch) fetchLabel = `${toolCalls.length} webzoekopdracht(en)…`;
       else if (hasUpdate) fetchLabel = `${toolCalls.length} geheugenupdate(s) voorbereiden…`;
       else if (hasSuggestDelete) fetchLabel = `${toolCalls.length} geheugensuggestie(s) voorbereiden…`;
+      else if (hasReadSection) fetchLabel = `${toolCalls.length} sectie(s) lezen…`;
+      else if (hasReadOutline) fetchLabel = `${toolCalls.length} document-outline(s) lezen…`;
       else if ((hasRead || hasReadMemory) && hasCreate) fetchLabel = `${toolCalls.length} bestand(en) lezen of aanmaken…`;
       else if (hasCreate && !hasRead && !hasReadMemory) fetchLabel = `${toolCalls.length} nieuw(e) bestand(en) aanmaken…`;
       else if ((hasRead || hasReadMemory) && !hasCreate) fetchLabel = `${toolCalls.length} bestand(en) volledig ophalen…`;
@@ -3333,6 +4652,7 @@ async function callCorpusAskAgentWithTools(
           agentLog(runId, "web_search", {
             query: truncStr(query, 240),
             ok: payload.ok,
+            error: payload.ok ? "" : String(payload.error || ""),
             resultCount: Array.isArray(payload.results) ? payload.results.length : 0,
           });
 
@@ -3342,8 +4662,61 @@ async function callCorpusAskAgentWithTools(
             content: JSON.stringify({
               ...payload,
               userFacingInstruction:
-                "Deze long-term-memory housekeeping is intern. Noem in de uiteindelijke reply niet dat dit bestand is aangemaakt, bijgewerkt, opgeslagen of waar het staat.",
+                "Gebruik deze webzoekresultaten alleen als actuele externe broninformatie. Noem relevante URL's in de uiteindelijke reply wanneer je feiten uit deze resultaten gebruikt.",
             }),
+          });
+          continue;
+        }
+
+        if (fnName === "search_confluence") {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          const spaceKey = typeof args.spaceKey === "string" ? args.spaceKey.trim() : "";
+          const limit = Number(args.limit || 10);
+          pushActivity({
+            phase: "confluence_search",
+            label: "Confluence doorzoeken",
+            detail: reason || query || undefined,
+          });
+          const payload = await searchConfluencePayload({ query, spaceKey, limit }, runId);
+          performanceMetrics.retrievedChars += payload.ok ? JSON.stringify(payload.results || []).length : 0;
+          agentLog(runId, "confluence_tool_search", {
+            query: truncStr(query, 240),
+            spaceKey,
+            ok: payload.ok,
+            resultCount: Array.isArray(payload.results) ? payload.results.length : 0,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ...payload,
+              userFacingInstruction:
+                "Gebruik de zoekresultaten om relevante pagina's te selecteren. Lees inhoudelijke pagina's daarna met read_confluence_page voordat je conclusies trekt.",
+            }),
+          });
+          continue;
+        }
+
+        if (fnName === "read_confluence_page") {
+          const pageId = typeof args.pageId === "string" ? args.pageId.trim() : "";
+          const pageUrl = typeof args.url === "string" ? args.url.trim() : "";
+          pushActivity({
+            phase: "confluence",
+            label: "Confluence-pagina ophalen",
+            detail: reason || pageId || pageUrl || undefined,
+          });
+          const payload = await fetchConfluencePagePayload({ pageId, url: pageUrl }, runId);
+          performanceMetrics.retrievedChars += payload.ok ? String(payload.text || payload.storageHtml || "").length : 0;
+          agentLog(runId, "confluence_tool_read", {
+            pageId: payload.id || pageId || confluencePageIdFromUrl(pageUrl),
+            ok: payload.ok,
+            chars: payload.ok ? String(payload.text || "").length : 0,
+            truncated: !!payload.truncated,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
           });
           continue;
         }
@@ -3357,6 +4730,7 @@ async function callCorpusAskAgentWithTools(
           });
 
           const payload = readCorpusMarkdownToolPayload(relPath);
+          performanceMetrics.retrievedChars += payload.ok ? String(payload.content || "").length : 0;
           agentLog(runId, "corpus_tool_read", {
             path: relPath,
             ok: payload.ok,
@@ -3376,6 +4750,55 @@ async function callCorpusAskAgentWithTools(
           continue;
         }
 
+        if (fnName === "read_corpus_outline") {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          pushActivity({
+            phase: "read_outline",
+            label: "Document-outline lezen",
+            path: relPath || "(pad ontbreekt)",
+            detail: reason || query || undefined,
+          });
+          const payload = readMarkdownOutlineToolPayload("working", relPath, query);
+          performanceMetrics.retrievedChars += payload.ok ? JSON.stringify(payload.sections || []).length : 0;
+          agentLog(runId, "corpus_tool_outline", {
+            path: relPath,
+            ok: payload.ok,
+            sectionCount: payload.sectionCount || 0,
+            query,
+            retrievalMeta: payload.retrievalMeta || null,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
+          });
+          continue;
+        }
+
+        if (fnName === "read_corpus_section") {
+          pushActivity({
+            phase: "read_section",
+            label: "Documentsectie lezen",
+            path: relPath || "(pad ontbreekt)",
+            detail: reason || args.section || undefined,
+          });
+          const payload = readMarkdownSectionToolPayload("working", relPath, args.section);
+          performanceMetrics.retrievedChars += payload.ok ? String(payload.content || "").length : 0;
+          agentLog(runId, "corpus_tool_section", {
+            path: relPath,
+            section: String(args.section || ""),
+            ok: payload.ok,
+            chars: payload.ok ? String(payload.content || "").length : 0,
+            truncated: !!payload.truncated,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
+          });
+          continue;
+        }
+
         if (fnName === "read_memory_markdown") {
           pushActivity({
             phase: "read_memory",
@@ -3385,6 +4808,7 @@ async function callCorpusAskAgentWithTools(
           });
 
           const payload = readMemoryMarkdownToolPayload(relPath);
+          performanceMetrics.retrievedChars += payload.ok ? String(payload.content || "").length : 0;
           agentLog(runId, "memory_tool_read", {
             path: relPath,
             ok: payload.ok,
@@ -3392,6 +4816,55 @@ async function callCorpusAskAgentWithTools(
             truncated: !!payload.truncated,
           });
 
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
+          });
+          continue;
+        }
+
+        if (fnName === "read_memory_outline") {
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          pushActivity({
+            phase: "read_memory_outline",
+            label: "Memory-outline lezen",
+            path: relPath || "(pad ontbreekt)",
+            detail: reason || query || undefined,
+          });
+          const payload = readMarkdownOutlineToolPayload("memory", relPath, query);
+          performanceMetrics.retrievedChars += payload.ok ? JSON.stringify(payload.sections || []).length : 0;
+          agentLog(runId, "memory_tool_outline", {
+            path: relPath,
+            ok: payload.ok,
+            sectionCount: payload.sectionCount || 0,
+            query,
+            retrievalMeta: payload.retrievalMeta || null,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
+          });
+          continue;
+        }
+
+        if (fnName === "read_memory_section") {
+          pushActivity({
+            phase: "read_memory_section",
+            label: "Memory-sectie lezen",
+            path: relPath || "(pad ontbreekt)",
+            detail: reason || args.section || undefined,
+          });
+          const payload = readMarkdownSectionToolPayload("memory", relPath, args.section);
+          performanceMetrics.retrievedChars += payload.ok ? String(payload.content || "").length : 0;
+          agentLog(runId, "memory_tool_section", {
+            path: relPath,
+            section: String(args.section || ""),
+            ok: payload.ok,
+            chars: payload.ok ? String(payload.content || "").length : 0,
+            truncated: !!payload.truncated,
+          });
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
@@ -3513,8 +4986,8 @@ async function callCorpusAskAgentWithTools(
     let reply = "";
     let viewerActions = [];
     try {
-      const parsed = parseAgentJsonResponse(contentStr);
-      reply = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+      const parsed = normalizeParsedAgentJsonResponse(parseAgentJsonResponse(contentStr));
+      reply = replyStringFromParsedAgentResponse(parsed);
       viewerActions = normalizeViewerActions(parsed?.viewerActions);
       const finalPending = normalizePendingMemoryActions(parsed?.pendingMemoryActions);
       for (const action of finalPending) {
@@ -3534,17 +5007,20 @@ async function callCorpusAskAgentWithTools(
       }
     } catch {
       noteLlmProseFallback(llmDebugOut);
-      reply = contentStr;
+      reply = recoverUserFacingReplyFromMixedContent(contentStr);
     }
 
     if (!reply) {
-      reply = contentStr;
+      reply = recoverUserFacingReplyFromMixedContent(contentStr);
     }
     const uniquePendingMemoryActions = dedupeMemoryActions(pendingMemoryActions);
     pendingMemoryActions.splice(0, pendingMemoryActions.length, ...uniquePendingMemoryActions);
     reply = ensureMemoryActionQuestion(reply, pendingMemoryActions);
     reply = ensureMemoryAppliedNotice(reply, executedMemoryActions);
     reply = stripMemoryHousekeepingFromReply(reply, executedMemoryActions);
+    reply = stripMemoryPermissionClaimsFromReply(reply);
+    performanceMetrics.replyChars = reply.length;
+    const finalPerformanceMetrics = finalizePerformanceMetrics(performanceMetrics, { replyChars: reply.length });
 
     agentLog(runId, "corpus_tool_done", {
       elapsedMs: Date.now() - t0,
@@ -3554,6 +5030,7 @@ async function callCorpusAskAgentWithTools(
       corpusCreatedCount: corpusCreatedPaths.length,
       executedMemoryActions: executedMemoryActions.length,
       pendingMemoryActions: pendingMemoryActions.length,
+      performanceMetrics: finalPerformanceMetrics,
     });
 
     pushActivity({ phase: "done", label: "Antwoord gereed." });
@@ -3565,6 +5042,7 @@ async function callCorpusAskAgentWithTools(
       corpusCreatedPaths,
       executedMemoryActions,
       pendingMemoryActions,
+      performanceMetrics: finalPerformanceMetrics,
     };
   }
 
@@ -3641,7 +5119,7 @@ async function callAskAgent(
                 ASK_CURIOSITY_RULE +
                 "Ask-modus mag long-term-memory-acties voorbereiden; de server voert uitvoerbare acties direct uit in Files/.memory/ als interne agent-housekeeping, zonder aparte gebruikersmelding. " +
                 "Als het antwoord duurzame stappen of herbruikbare kennis bevat, bepaal dan zelf of dit in één of meerdere nieuwe memory-documenten hoort of in één of meerdere bestaande memory-documenten. Vraag niet of de gebruiker dit wil opslaan of of er een eigen document nodig is. " +
-                "Noem in reply geen storage-beslissingen, bestandsnamen, memory-paden of housekeeping-acties zoals aanmaken, bijwerken, opslaan of vastleggen, tenzij de gebruiker expliciet vraagt waar iets staat of om een audit/inspectie van memory. Zeg ook niet dat de gebruiker iets kan plakken of zelf een bestand moet aanmaken als jij dit via memory-acties kunt doen. " +
+                "Noem in reply geen storage-beslissingen, bestandsnamen, memory-paden of housekeeping-acties zoals aanmaken, bijwerken, opslaan of vastleggen, tenzij de gebruiker expliciet vraagt waar iets staat of om een audit/inspectie van memory. Zeg ook niet dat je geen schrijfrechten op Files/.memory/ hebt en zeg niet dat de gebruiker iets kan plakken of zelf een bestand moet aanmaken als jij dit via memory-acties kunt doen. " +
                 "Als de gebruiker vraagt om het geopende werkdocument inhoudelijk aan te passen, leg kort uit dat Agent-modus daarvoor bedoeld is; retourneer geen memory-actie die het werkdocument herschrijft. " +
                 "Retourneer alleen top-level pendingMemoryActions voor long-term memory onder Files/.memory/. Dit mag een array met meerdere acties zijn: {kind:\"create\"|\"update\", path, reason, content of find/replace, sources}. Het path is relatief aan Files/.memory/. " +
                 (replyMarkdown
@@ -3725,7 +5203,7 @@ async function callAskAgent(
 
   let parsed;
   try {
-    parsed = parseAgentJsonResponse(contentStr);
+    parsed = normalizeParsedAgentJsonResponse(parseAgentJsonResponse(contentStr));
   } catch (e) {
     noteLlmProseFallback(llmDebugOut);
     agentLog(runId, "ask_llm_prose_fallback", {
@@ -3733,17 +5211,16 @@ async function callAskAgent(
       proseChars: contentStr.length,
       parseError: String(e?.message || e),
     });
-    return { reply: contentStr, pendingMemoryActions: [] };
+    return { reply: stripMemoryPermissionClaimsFromReply(recoverUserFacingReplyFromMixedContent(contentStr)), pendingMemoryActions: [] };
   }
   const pendingMemoryActions = normalizePendingMemoryActions(parsed?.pendingMemoryActions);
-  const reply = ensureMemoryActionQuestion(
-    typeof parsed?.reply === "string" ? parsed.reply.trim() : "",
-    pendingMemoryActions,
+  const reply = stripMemoryPermissionClaimsFromReply(
+    ensureMemoryActionQuestion(replyStringFromParsedAgentResponse(parsed), pendingMemoryActions),
   );
   if (!reply) {
     noteLlmProseFallback(llmDebugOut);
     agentLog(runId, "ask_llm_empty_reply_use_prose", { elapsedMs, proseChars: contentStr.length });
-    return { reply: contentStr, pendingMemoryActions };
+    return { reply: stripMemoryPermissionClaimsFromReply(recoverUserFacingReplyFromMixedContent(contentStr)), pendingMemoryActions };
   }
   return { reply, pendingMemoryActions };
 }
@@ -3864,7 +5341,8 @@ async function callMemoryProposalAgent(
 
 async function executeDurableMemoryFallback(config, message, history, runId, llmDebugOut = null, options = {}) {
   const dreamMemoryRequest = looksLikeDreamMemoryRequest(message);
-  if (!looksLikeDurableMemorySignal(message) && !dreamMemoryRequest) {
+  const forced = options.force === true;
+  if (!forced && !looksLikeDurableMemorySignal(message) && !dreamMemoryRequest) {
     return { executedMemoryActions: [], pendingMemoryActions: [], corpusCreatedPaths: [], targetPath: "" };
   }
   let memoryManifest = readManifest(MARKDOWN_DIR, { scope: "memory", indexDir: MEMORY_INDEX_DIR });
@@ -3875,7 +5353,8 @@ async function executeDurableMemoryFallback(config, message, history, runId, llm
   const targetSeed = dreamMemoryRequest
     ? `${message}\n${options.currentPath || ""}\n${String(options.currentMarkdown || "").slice(0, 1200)}`
     : message;
-  const targetPath = pickMemoryTargetPath(targetSeed, memoryManifest, inferDurableMemoryTargetPath(message));
+  const preferredTargetPath = typeof options.targetPath === "string" ? options.targetPath.trim() : "";
+  const targetPath = preferredTargetPath || pickMemoryTargetPath(targetSeed, memoryManifest, inferDurableMemoryTargetPath(message));
   if (!targetPath) {
     return { executedMemoryActions: [], pendingMemoryActions: [], corpusCreatedPaths: [], targetPath: "" };
   }
@@ -3922,7 +5401,13 @@ async function executeDurableMemoryFallback(config, message, history, runId, llm
     executedMemoryActions: executedMemoryActions.length,
     pendingMemoryActions: pendingMemoryActions.length,
   });
-  return { executedMemoryActions, pendingMemoryActions, corpusCreatedPaths, targetPath };
+  return {
+    reply: stripMemoryPermissionClaimsFromReply(fallback.reply || ""),
+    executedMemoryActions,
+    pendingMemoryActions,
+    corpusCreatedPaths,
+    targetPath,
+  };
 }
 
 function backupMarkdownIfNeeded(name, full, state) {
@@ -3949,6 +5434,56 @@ function backupExternalMarkdownIfNeeded(name, markdownSnapshot, state) {
 const app = express();
 
 app.disable("x-powered-by");
+
+function safeEqualString(a, b) {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+function parseBasicAuthorization(header) {
+  const value = String(header || "");
+  const match = /^Basic\s+(.+)$/i.exec(value);
+  if (!match) return null;
+  try {
+    const decoded = Buffer.from(match[1], "base64").toString("utf8");
+    const sep = decoded.indexOf(":");
+    if (sep < 0) return null;
+    return {
+      user: decoded.slice(0, sep),
+      password: decoded.slice(sep + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function requireIomsBasicAuth(req, res, next) {
+  if (!IOMS_AUTH_ENABLED) {
+    next();
+    return;
+  }
+  if (!IOMS_AUTH_PASSWORD) {
+    res.status(503).send("iOMS auth is not configured. Set IOMS_AUTH_PASSWORD before starting the server.");
+    return;
+  }
+  const credentials = parseBasicAuthorization(req.headers.authorization);
+  if (
+    credentials &&
+    safeEqualString(credentials.user, IOMS_AUTH_USER) &&
+    safeEqualString(credentials.password, IOMS_AUTH_PASSWORD)
+  ) {
+    next();
+    return;
+  }
+  res.setHeader("WWW-Authenticate", 'Basic realm="iOMS", charset="UTF-8"');
+  res.status(401).send("Authentication required.");
+}
+
+app.use(requireIomsBasicAuth);
 /** Cross-origin als de UI op een andere poort/host draait dan deze API (Vite :5173 → API :8787). */
 const enableLocalhostApiCors =
   apiOnly || !isDev || String(process.env.ENABLE_LOCALHOST_CORS || "").trim() === "1";
@@ -4041,6 +5576,74 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, handlerRev: API_HANDLER_REVISION });
 });
 
+app.get("/api/confluence/config", (_req, res) => {
+  res.json({ ok: true, ...confluenceConfigPayload() });
+});
+
+app.post("/api/confluence/search", async (req, res) => {
+  const runId = crypto.randomUUID();
+  try {
+    const payload = await searchConfluencePayload(
+      {
+        query: req.body?.query,
+        spaceKey: req.body?.spaceKey,
+        limit: req.body?.limit,
+      },
+      runId,
+    );
+    if (!payload.ok) {
+      res.status(/config ontbreekt|ontbreekt/i.test(payload.error || "") ? 400 : 502).json(payload);
+      return;
+    }
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/confluence/page", async (req, res) => {
+  const runId = crypto.randomUUID();
+  try {
+    const payload = await fetchConfluencePagePayload(
+      {
+        pageId: req.body?.pageId,
+        url: req.body?.url,
+        expand: req.body?.expand,
+      },
+      runId,
+    );
+    if (!payload.ok) {
+      res.status(/config ontbreekt|ontbreekt/i.test(payload.error || "") ? 400 : 502).json(payload);
+      return;
+    }
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.put("/api/confluence/page", async (req, res) => {
+  const runId = crypto.randomUUID();
+  try {
+    const payload = await updateConfluencePageFromMarkdown(
+      {
+        pageId: req.body?.pageId,
+        title: req.body?.title,
+        baseVersion: req.body?.baseVersion,
+        markdown: req.body?.markdown,
+      },
+      runId,
+    );
+    if (!payload.ok) {
+      res.status(payload.conflict ? 409 : 400).json(payload);
+      return;
+    }
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 app.get("/api/agent-config", (_req, res) => {
   try {
     res.json(publicAgentConfig());
@@ -4064,6 +5667,38 @@ app.post("/api/agent-models", async (req, res) => {
     res.json({ ok: true, models });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e), models: [] });
+  }
+});
+
+app.get("/api/prompt-macros", (_req, res) => {
+  try {
+    res.json({ ok: true, ...readPromptMacrosPayload() });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/prompt-macros", (req, res) => {
+  try {
+    res.json({ ok: true, ...createPromptMacro(req.body ?? {}) });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
+  }
+});
+
+app.put("/api/prompt-macros/:id", (req, res) => {
+  try {
+    res.json({ ok: true, ...updatePromptMacro(req.params.id, req.body ?? {}) });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
+  }
+});
+
+app.delete("/api/prompt-macros/:id", (req, res) => {
+  try {
+    res.json({ ok: true, ...deletePromptMacro(req.params.id) });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
   }
 });
 
@@ -4510,6 +6145,37 @@ app.post("/api/markdown-file", (req, res) => {
   }
 });
 
+app.delete("/api/markdown-file", (req, res) => {
+  const name = safeMarkdownPath(req.query?.name);
+  const full = name ? markdownFullPath(name) : null;
+  if (!name || !full) {
+    res.status(400).json({ error: "Invalid or missing markdown file name" });
+    return;
+  }
+  try {
+    if (!fs.existsSync(full)) {
+      res.status(404).json({ error: "Bestand niet gevonden" });
+      return;
+    }
+    if (!fs.statSync(full).isFile()) {
+      res.status(400).json({ error: "Geen bestand" });
+      return;
+    }
+    fs.unlinkSync(full);
+
+    const review = reviewJsonPath(name);
+    if (review && fs.existsSync(review)) fs.unlinkSync(review);
+
+    const backup = markdownBackupPath(name);
+    if (backup && fs.existsSync(backup)) fs.unlinkSync(backup);
+
+    scheduleCorpusRebuildAfterSave();
+    res.json({ ok: true, name });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 app.post("/api/corpus-index/rebuild", async (_req, res) => {
   try {
     const m = await runCorpusIndexRebuild("manual");
@@ -4526,6 +6192,63 @@ app.post("/api/corpus-index/rebuild", async (_req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/second-brain/context", (_req, res) => {
+  try {
+    const { workingManifest, memoryManifest } = readSecondBrainManifestsOrThrow();
+    res.json({
+      generatedAt: new Date().toISOString(),
+      working: secondBrainSummaryFromManifest(workingManifest, "working"),
+      memory: secondBrainSummaryFromManifest(memoryManifest, "memory"),
+    });
+  } catch (e) {
+    res.status(e?.statusCode || 500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/second-brain/unlinked-mentions", (req, res) => {
+  try {
+    const limit = Math.min(1000, Math.max(1, Number(req.query?.limit || 500) || 500));
+    res.json(secondBrainUnlinkedMentionPayload(limit));
+  } catch (e) {
+    res.status(e?.statusCode || 500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/second-brain/link-mentions", async (req, res) => {
+  try {
+    const { workingManifest, memoryManifest } = readSecondBrainManifestsOrThrow();
+    const scope = String(req.body?.scope || "all").toLowerCase();
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+    const maxPerFile = Math.min(100, Math.max(1, Number(req.body?.maxPerFile || 50) || 50));
+    const results = [];
+    if (scope === "all" || scope === "working") {
+      results.push(applyUnlinkedMentionSuggestionsForScope("working", workingManifest, MARKDOWN_DIR, { ids, maxPerFile }));
+    }
+    if (scope === "all" || scope === "memory") {
+      results.push(applyUnlinkedMentionSuggestionsForScope("memory", memoryManifest, MEMORY_DIR, { ids, maxPerFile }));
+    }
+    if (!["all", "working", "memory"].includes(scope)) {
+      res.status(400).json({ error: "Scope moet 'all', 'working' of 'memory' zijn." });
+      return;
+    }
+    const rebuilt = results.some((result) => result.appliedCount > 0)
+      ? await runCorpusIndexRebuild("second_brain_link_mentions")
+      : null;
+    res.json({
+      ok: true,
+      scope,
+      filesChanged: results.reduce((sum, result) => sum + result.filesChanged, 0),
+      appliedCount: results.reduce((sum, result) => sum + result.appliedCount, 0),
+      skippedCount: results.reduce((sum, result) => sum + result.skippedCount, 0),
+      results,
+      entryCount: rebuilt?.working?.entryCount,
+      memoryEntryCount: rebuilt?.memory?.entryCount,
+    });
+  } catch (e) {
+    res.status(e?.statusCode || 500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -5073,8 +6796,9 @@ app.post("/api/agent/chat", async (req, res) => {
   const durableMemorySignal = looksLikeDurableMemorySignal(message);
   const dreamMemoryRequest = looksLikeDreamMemoryRequest(message);
   const activityLogRequest = looksLikeActivityLogRequest(message);
-  const useCorpusTools = corpusWide || memoryWriteRequest || (mode === "ask" && (durableMemorySignal || dreamMemoryRequest));
-  const askToolMode = useCorpusTools || webSearch || activityLogRequest;
+  const askMemoryTools = mode === "ask";
+  const useCorpusTools = mode === "ask";
+  const askToolMode = mode === "ask" || webSearch || activityLogRequest;
   const activityStream = (corpusWide || webSearch) && req.body?.activityStream !== false;
   const replyMarkdown = req.body?.replyMarkdown !== false;
   const activityBase = (extra = {}) => ({
@@ -5193,16 +6917,28 @@ app.post("/api/agent/chat", async (req, res) => {
               workingBootstrap.markdownBlob +
               `\n\n---\n\n` +
               `## Long-term memory-context\n\n` +
-              `Dit is agent-owned long-term memory onder Files/.memory/. Create/update-tools schrijven uitsluitend hier.\n\n` +
+              `Dit is agent-owned long-term memory onder Files/.memory/. In Ask zijn memory-write tools beschikbaar; create/update-tools schrijven uitsluitend hier.\n\n` +
               memoryBootstrap.markdownBlob +
               `\n\n---\n\n` +
               `## Actieve chat short-term memory\n\n` +
-              `Alleen de meegestuurde actieve chatgeschiedenis is short-term memory. Andere chats mogen niet als live context worden gebruikt.`,
+              `Alleen de meegestuurde actieve chatgeschiedenis is short-term memory. Andere chats mogen niet als live context worden gebruikt.` +
+              `\n\n---\n\n` +
+              `## Huidig geopend Markdown-document\n\n` +
+              `Dit is het document dat op het moment van de Ask-vraag openstaat. Gebruik dit als primaire lokale context naast corpus- en memory-tools.\n\n` +
+              `Pad: ${name || "(geen pad meegestuurd)"}\n\n` +
+              `${markdown || "(geen geopend document of lege inhoud)"}`,
             pickedPaths: [
               ...workingBootstrap.pickedPaths.map((p) => `working:${p}`),
               ...memoryBootstrap.pickedPaths.map((p) => `memory:${p}`),
             ],
+            retrievalMeta: {
+              working: workingBootstrap.retrievalMeta || null,
+              memory: memoryBootstrap.retrievalMeta || null,
+            },
           };
+          if (llmDebug && typeof llmDebug === "object") {
+            llmDebug.retrievalMeta = bootstrap.retrievalMeta;
+          }
           if (memoryWriteRequest && memoryTargetPath) {
             bootstrap.markdownBlob +=
               `\n\n---\n\n## Verplicht geheugenvoorstel\n\n` +
@@ -5251,6 +6987,7 @@ app.post("/api/agent/chat", async (req, res) => {
           markdownChars: bootstrap.markdownBlob.length,
           pickedPaths: bootstrap.pickedPaths.slice(0, 40),
           pickedCount: bootstrap.pickedPaths.length,
+          retrievalMeta: bootstrap.retrievalMeta || null,
           corpusWide,
           webSearch,
           memoryWriteRequest,
@@ -5259,8 +6996,10 @@ app.post("/api/agent/chat", async (req, res) => {
         });
 
         const ensureMemoryProposalFallback = async (result) => {
+          const deferredMemoryWrite = hasMemoryWriteDeferral(result?.reply);
+          const replyTargetPath = memoryPathFromText(result?.reply);
           if (
-            (!memoryWriteRequest && !durableMemorySignal && !dreamMemoryRequest) ||
+            (!memoryWriteRequest && !durableMemorySignal && !dreamMemoryRequest && !deferredMemoryWrite) ||
             (Array.isArray(result.executedMemoryActions) && result.executedMemoryActions.length) ||
             (Array.isArray(result.pendingMemoryActions) && result.pendingMemoryActions.length)
           ) {
@@ -5270,7 +7009,7 @@ app.post("/api/agent/chat", async (req, res) => {
             .map((p) => String(p || ""))
             .find((p) => p.startsWith("memory:"))
             ?.replace(/^memory:/, "");
-          const targetPath = memoryTargetPath || pickedMemoryPath || "";
+          const targetPath = memoryTargetPath || replyTargetPath || pickedMemoryPath || "";
           const targetPayload = readMemoryMarkdownToolPayload(targetPath);
           if (!targetPayload.ok || typeof targetPayload.content !== "string") {
             agentLog(runId, "memory_fallback_skipped", {
@@ -5283,7 +7022,7 @@ app.post("/api/agent/chat", async (req, res) => {
             config,
             targetPath,
             targetPayload.content,
-            message,
+            `${message}\n\nAssistant deferral/context:\n${result?.reply || ""}`,
             history,
             { runId },
             llmDebug,
@@ -5348,10 +7087,13 @@ app.post("/api/agent/chat", async (req, res) => {
                 enableCorpusTools: useCorpusTools,
                 enableWebSearch: webSearch,
                 enableActivityLogs: activityLogRequest,
-                enableMemoryWriteTools: memoryWriteRequest || durableMemorySignal || dreamMemoryRequest,
+                enableConfluence: true,
+                enableMemoryWriteTools: askMemoryTools,
+                retrievalMeta: bootstrap.retrievalMeta || null,
               },
             );
             result = await ensureMemoryProposalFallback(result);
+            result.reply = stripMemoryPermissionClaimsFromReply(result.reply);
             streamedReplyChars = result.reply.length;
             queueAgentInstructionsUpdate(config, {
               runId,
@@ -5365,6 +7107,7 @@ app.post("/api/agent/chat", async (req, res) => {
               changed: false,
               memoryActionCount: Array.isArray(result.executedMemoryActions) ? result.executedMemoryActions.length : 0,
               corpusCreatedPaths: Array.isArray(result.corpusCreatedPaths) ? result.corpusCreatedPaths : [],
+              performanceMetrics: result.performanceMetrics || null,
             }));
             res.write(
               `${JSON.stringify({
@@ -5383,6 +7126,7 @@ app.post("/api/agent/chat", async (req, res) => {
                 ...(Array.isArray(result.pendingMemoryActions) && result.pendingMemoryActions.length
                   ? { pendingMemoryActions: result.pendingMemoryActions }
                   : {}),
+                ...(result.performanceMetrics ? { performanceMetrics: result.performanceMetrics } : {}),
                 ...(llmDebug ? { debugLlm: llmDebug } : {}),
               })}\n`,
             );
@@ -5418,10 +7162,13 @@ app.post("/api/agent/chat", async (req, res) => {
               enableCorpusTools: useCorpusTools,
               enableWebSearch: webSearch,
               enableActivityLogs: activityLogRequest,
-              enableMemoryWriteTools: memoryWriteRequest || durableMemorySignal || dreamMemoryRequest,
+              enableConfluence: true,
+              enableMemoryWriteTools: askMemoryTools,
+              retrievalMeta: bootstrap.retrievalMeta || null,
             },
           );
           result = await ensureMemoryProposalFallback(result);
+          result.reply = stripMemoryPermissionClaimsFromReply(result.reply);
           queueAgentInstructionsUpdate(config, {
             runId,
             mode: "ask",
@@ -5434,6 +7181,7 @@ app.post("/api/agent/chat", async (req, res) => {
             changed: false,
             memoryActionCount: Array.isArray(result.executedMemoryActions) ? result.executedMemoryActions.length : 0,
             corpusCreatedPaths: Array.isArray(result.corpusCreatedPaths) ? result.corpusCreatedPaths : [],
+            performanceMetrics: result.performanceMetrics || null,
           }));
           agentLog(runId, "chat_ask_done", {
             replyChars: result.reply.length,
@@ -5460,6 +7208,7 @@ app.post("/api/agent/chat", async (req, res) => {
             ...(Array.isArray(result.pendingMemoryActions) && result.pendingMemoryActions.length
               ? { pendingMemoryActions: result.pendingMemoryActions }
               : {}),
+            ...(result.performanceMetrics ? { performanceMetrics: result.performanceMetrics } : {}),
             ...(llmDebug ? { debugLlm: llmDebug } : {}),
           });
         } catch (e) {
@@ -5493,6 +7242,41 @@ app.post("/api/agent/chat", async (req, res) => {
       }
       let reply = ensureMemoryAppliedNotice(askResult.reply, normalAskExecutedMemoryActions);
       reply = stripMemoryHousekeepingFromReply(reply, normalAskExecutedMemoryActions);
+      const normalAskDeferredMemoryWrite = hasMemoryWriteDeferral(askResult.reply);
+      if (
+        normalAskDeferredMemoryWrite &&
+        !normalAskExecutedMemoryActions.length &&
+        !normalAskPendingMemoryActions.length
+      ) {
+        try {
+          const forcedMemory = await executeDurableMemoryFallback(
+            config,
+            `${message}\n\nAssistant deferral/context:\n${askResult.reply || ""}`,
+            history,
+            runId,
+            llmDebug,
+            {
+              replyMarkdown,
+              force: true,
+              targetPath: memoryPathFromText(askResult.reply),
+              currentPath: name || "",
+              currentMarkdown: markdown,
+            },
+          );
+          normalAskExecutedMemoryActions.push(...(forcedMemory.executedMemoryActions || []));
+          normalAskPendingMemoryActions.push(...(forcedMemory.pendingMemoryActions || []));
+          normalAskCorpusCreatedPaths.push(...(forcedMemory.corpusCreatedPaths || []));
+          reply = stripMemoryHousekeepingFromReply(
+            forcedMemory.executedMemoryActions?.length || forcedMemory.pendingMemoryActions?.length
+              ? forcedMemory.reply || reply
+              : reply,
+            normalAskExecutedMemoryActions,
+          );
+        } catch (e) {
+          agentLog(runId, "chat_ask_forced_memory_fallback_error", { error: String(e?.message || e) });
+        }
+      }
+      reply = stripMemoryPermissionClaimsFromReply(reply);
       queueAgentInstructionsUpdate(config, {
         runId,
         mode: "ask",
@@ -5588,7 +7372,7 @@ app.post("/api/agent/chat", async (req, res) => {
       agentLog(runId, "chat_agent_patch_error", { document: name, error: String(e?.message || e) });
       res.status(422).json({
         error: String(e?.message || e),
-        reply: typeof parsed?.reply === "string" ? parsed.reply : "",
+        reply: replyStringFromParsedAgentResponse(parsed),
         ...(llmDebug ? { debugLlm: llmDebug } : {}),
       });
       return;
@@ -5609,7 +7393,7 @@ app.post("/api/agent/chat", async (req, res) => {
         }
       }
       try {
-        const replyTextRaw = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+        const replyTextRaw = replyStringFromParsedAgentResponse(parsed);
         const replyTextForReview =
           replyTextRaw ||
           (changed ? `Toegepast: ${changesRaw.length} patch(es).` : "Geen wijzigingen doorgevoerd.");
@@ -5632,7 +7416,7 @@ app.post("/api/agent/chat", async (req, res) => {
       patches: changesRaw.length,
       wroteFile,
     });
-    const replyTextRaw = typeof parsed?.reply === "string" ? parsed.reply.trim() : "";
+    const replyTextRaw = replyStringFromParsedAgentResponse(parsed);
     const replyText =
       replyTextRaw ||
       (changed ? `Toegepast: ${changesRaw.length} patch(es).` : "Geen wijzigingen doorgevoerd.");

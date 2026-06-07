@@ -1,8 +1,14 @@
 # Secrets & lokale config (nooit committen)
 .env
 .env.local
+**/.env.docker.local
+**/.env.pi
 **/agent.config.json
 markdown-viewer/agent.config
+markdown-viewer/agent-chats.json
+markdown-viewer/agent-activity-logs.jsonl
+markdown-viewer/prompt-macros.json
+markdown-viewer/library-root.json
 
 # Dependencies & build
 **/node_modules/

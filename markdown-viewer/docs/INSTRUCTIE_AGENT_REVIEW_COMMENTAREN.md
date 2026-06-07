@@ -56,7 +56,7 @@ Het bestand `Files/.reviews/<naam>.md.json` **bestaat vaak nog niet**. Dat is **
 - De echte config bevat `apiKey`, `endpoint` en `model`. `agent.config.json` is lokaal en hoort niet in Git.
 - De browser krijgt de opgeslagen API key niet terug; de API meldt alleen of er een key aanwezig is.
 - In de viewer zijn er twee knoppen: **Agent config** en **Agent uitvoeren**. De run geldt voor het geselecteerde markdownbestand.
-- Een nieuwe agent-run wordt geblokkeerd zolang er nog eerdere agentwijzigingen openstaan. De gebruiker moet die eerst met **Akkoord** of **Niet akkoord** afhandelen.
+- Een nieuwe agent-run wordt geblokkeerd zolang er nog eerdere agentwijzigingen openstaan. De gebruiker moet die eerst met **Akkoord** of **Niet akkoord** afhandelen. Die knoppen staan onder het **laatste agentantwoord** in het **Agent**-chatvenster (niet in de ribbon).
 
 ---
 
@@ -232,12 +232,34 @@ Geen wijziging:
 
 ---
 
-## 8. Samenvatting voor prompting
+## 8. Mermaid en Chart.js in de markdown-viewer
 
-Korte prompt die je aan een agent kunt meegeven:
+De viewer rendert na parsing twee soorten **fenced blocks** automatisch (naast normale Markdown):
 
-> Lees `Files/<naam>.md`. Probeer `Files/.reviews/<naam>.md.json` te openen; **als dat bestand ontbreekt**, neem `comments` als lege array (§2). Loop alle `comments` langs. Waar `body` of een relevante `reply` een opdracht met `@agent` bevat: pas het markdownbestand daarop aan, sla op, en voeg op dat commentaar een `replies`-item toe (author Agent) met een korte uitleg van de wijzigingen — **zonder** `@agent` in die uitleg (§4). Maak zelf geen rollback-snapshot; als backup nodig is, verzorgt de software dat. De gebruiker handelt daarna af met Akkoord/Niet akkoord; verwijder de oorspronkelijke thread niet zelf.
+### Mermaid
+
+- Open met een regel **` ```mermaid `** (drie backticks, direct gevolgd door `mermaid`), sluit af met **` ``` `** op een eigen regel.
+- Daartussen: geldige **Mermaid**-definitie (flowchart, sequence diagram, enz.) volgens de Mermaid-syntax.
+- Gebruik **geen geneste** triple-backtick-blokken binnen de Mermaid-inhoud.
+
+### Chart.js
+
+- Open met **` ```chartjs `** of **` ```chart `**, sluit af met **` ``` `**.
+- Daartussen: **alleen strikte JSON** (geen commentaar, geen trailing komma’s): een object met minimaal:
+  - **`"type"`** — string, bijv. `"bar"`, `"line"`, `"pie"` (Chart.js v4-charttypes);
+  - **`"data"`** — object met o.a. `labels` en `datasets` zoals in de Chart.js-documentatie.
+- Optioneel **`"options"`** voor titel, legenda, schaal, enz.
+
+**Voor agents (ingebouwd en extern):** bij wijzigingen via find/replace het **hele fenced blok** (van de openende ``` tot en met de sluitende ```) in `find` opnemen, of voldoende unieke context zodat de patch exact één keer matcht. Nieuwe diagrammen op dezelfde manier invoegen als platte Markdown-tekst.
 
 ---
 
-**Versie:** 1.12 — `replaceAll: true` toegevoegd voor expliciete documentbrede terminologievervangingen.
+## 9. Samenvatting voor prompting
+
+Korte prompt die je aan een agent kunt meegeven:
+
+> Lees `Files/<naam>.md`. Probeer `Files/.reviews/<naam>.md.json` te openen; **als dat bestand ontbreekt**, neem `comments` als lege array (§2). Loop alle `comments` langs. Waar `body` of een relevante `reply` een opdracht met `@agent` bevat: pas het markdownbestand daarop aan, sla op, en voeg op dat commentaar een `replies`-item toe (author Agent) met een korte uitleg van de wijzigingen — **zonder** `@agent` in die uitleg (§4). Maak zelf geen rollback-snapshot; als backup nodig is, verzorgt de software dat. De gebruiker handelt daarna af met Akkoord/Niet akkoord; verwijder de oorspronkelijke thread niet zelf. Voor diagrammen/grafieken: zie §8 (Mermaid / Chart.js).
+
+---
+
+**Versie:** 1.13 — §8 toegevoegd: Mermaid en Chart.js; systeemprompt server uitgebreid.

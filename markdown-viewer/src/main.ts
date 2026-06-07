@@ -7,14 +7,18 @@ import {
   applyAgentMemoryActions,
   clearAgentLogs,
   cleanupAgentTranscript,
+  createPromptMacro,
   createAgentChatSession,
   createMarkdownFolder,
   deleteAgentChatSession,
+  deleteMarkdownFile,
+  deletePromptMacro,
   fetchAgentConfig,
   fetchAgentChatSessions,
   fetchAgentInstructions,
   fetchAgentLogs,
   fetchAgentModels,
+  fetchConfluencePage,
   fetchDocxTemplates,
   fetchDocxTemplatePlaceholders,
   fetchMemoryFile,
@@ -25,9 +29,13 @@ import {
   fetchMarkdownFile,
   fetchMarkdownIndex,
   fetchReviewComments,
+  fetchSecondBrainContext,
+  fetchSecondBrainUnlinkedMentions,
+  fetchPromptMacros,
   fetchTemplate,
   fetchTemplateFiles,
   importDocxToMarkdown,
+  linkSecondBrainUnlinkedMentions,
   renameMarkdownPath,
   promoteAgentChatSession,
   promoteStaleAgentChats,
@@ -37,14 +45,20 @@ import {
   runAgent,
   saveMarkdownFile,
   saveAgentConfig,
+  saveConfluencePage,
   saveAgentInstructions,
   saveReviewComments,
+  searchConfluencePages,
   type AgentChatMode,
   type AgentChatSession,
   type AgentChatTurn,
   type AgentMemoryAction,
+  type AgentPerformanceMetrics,
+  type ConfluenceSearchResult,
   type CorpusActivityEvent,
+  type PromptMacro,
   type ViewerAgentAction,
+  updatePromptMacro,
   updateAgentChatSession,
 } from "./api";
 import { destroyChartsInRoot, runChartJsInRoot } from "./chartJsBlocks";
@@ -224,6 +238,15 @@ function mountProseArtifacts(merged: ViewerTemplate, html: string, proseHost: HT
 /** Class op elk bewerk-“vel”; matcht flatten in htmlFromEditRootForMarkdown. */
 const EDIT_SHEET_PAGE_CLASS = "mv-page--editing-sheet";
 
+function lockConfluenceMacroPlaceholders(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>(".mv-confluence-macro[data-confluence-macro-b64]").forEach((node) => {
+    node.contentEditable = "false";
+    node.setAttribute("aria-readonly", "true");
+    node.setAttribute("role", "note");
+    node.title = "Confluence macro: niet bewerkbaar. Bij opslaan wordt de originele macro teruggezet.";
+  });
+}
+
 function mountEditSheetPages(host: HTMLElement, html: string): void {
   destroyChartsInRoot(host);
   host.replaceChildren();
@@ -236,6 +259,7 @@ function mountEditSheetPages(host: HTMLElement, html: string): void {
     art.append(inner);
     host.append(art);
   }
+  lockConfluenceMacroPlaceholders(host);
   void Promise.all([runMermaidInRoot(host), runChartJsInRoot(host)]);
 }
 
@@ -384,12 +408,20 @@ export async function bootstrap() {
   let reviewComments: ReviewComment[] = [];
   let reviewDraftRange: Range | null = null;
   let selectedFolder = "";
+  let externalDocumentKind: "none" | "disk" | "confluence" = "none";
   let externalFileHandle: FileSystemFileHandle | null = null;
   let externalFileLabel = "";
+  let externalConfluencePage: {
+    id: string;
+    title: string;
+    version: number;
+    url: string;
+  } | null = null;
   let agentChatMode: AgentChatMode = "agent";
   let agentChatSessions: AgentChatSession[] = [];
   let activeAgentChatId = "";
   let agentChatHistory: AgentChatTurn[] = [];
+  let promptMacros: PromptMacro[] = [];
   let agentChatRequestBusy = false;
   let pendingMemoryActions: AgentMemoryAction[] = [];
   let revertibleMemoryActions: AgentMemoryAction[] = [];
@@ -430,15 +462,23 @@ export async function bootstrap() {
   const tplSelect = tplField.querySelector("select")!;
 
   const toolbarDocName = el("span", "mv-toolbar__doc-name", "—");
-  const renameMdBtn = el("button", "mv-tb-btn mv-tb-btn--quiet mv-toolbar__rename-btn", "Hernoemen…");
-  renameMdBtn.type = "button";
-  renameMdBtn.title =
-    "Bestand hernoemen: documenten in Files/ via de server; bestanden geopend met Openen… op je schijf via de browser (move of Opslaan als). Opmerkingen/backup in Files/ gaan bij serverbestanden mee.";
-  renameMdBtn.disabled = true;
   const toolbarDocRow = el("div", "mv-toolbar__doc-row");
-  toolbarDocRow.append(toolbarDocName, renameMdBtn);
+  toolbarDocRow.append(toolbarDocName);
   const toolbarDoc = el("div", "mv-toolbar__doc");
   toolbarDoc.append(el("span", "mv-toolbar__doc-eyebrow", "Document"), toolbarDocRow);
+
+  const mobileTopbar = el("div", "mv-mobile-topbar");
+  const mobileFileTreeBtn = el("button", "mv-mobile-icon-btn", "Bestanden");
+  mobileFileTreeBtn.type = "button";
+  mobileFileTreeBtn.setAttribute("aria-label", "Bestandsboom openen");
+  const mobileDocName = el("span", "mv-mobile-doc-name", "—");
+  const mobileChatBtn = el("button", "mv-mobile-icon-btn", "Agent");
+  mobileChatBtn.type = "button";
+  mobileChatBtn.setAttribute("aria-label", "Agent-chat openen");
+  const mobileMenuBtn = el("button", "mv-mobile-icon-btn mv-mobile-icon-btn--menu", "Menu");
+  mobileMenuBtn.type = "button";
+  mobileMenuBtn.setAttribute("aria-label", "Menu openen");
+  mobileTopbar.append(mobileFileTreeBtn, mobileDocName, mobileChatBtn, mobileMenuBtn);
 
   const actions = el("div", "mv-toolbar__actions");
   const browseFilesBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Openen…");
@@ -460,11 +500,27 @@ export async function bootstrap() {
   docxImportBtn.type = "button";
   docxImportBtn.title =
     "Importeer een Word-bestand (.docx): omzetten naar Markdown en opslaan in de werkmap (Files/).";
+  const confluenceImportBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Confluence");
+  confluenceImportBtn.type = "button";
+  confluenceImportBtn.title =
+    "Importeer een Confluence-pagina tijdelijk in de editor en sla wijzigingen later terug naar Confluence.";
+  const confluenceSearchBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Zoek Confluence");
+  confluenceSearchBtn.type = "button";
+  confluenceSearchBtn.title = "Zoek Confluence-pagina's via de server-side PAT en importeer een gevonden pagina.";
   const printBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Afdruk");
   printBtn.type = "button";
   printBtn.title =
     "Echte nieuwe papier-/PDF-pagina’s bij # en ## zie je in het afdrukvoorbeeld of PDF; op het scherm tonen witte blokken tussen hoofdstukken.";
-  actions.append(browseFilesBtn, pasteMdBtn, settingsBtn, wordExportBtn, docxImportBtn, printBtn);
+  actions.append(
+    browseFilesBtn,
+    pasteMdBtn,
+    settingsBtn,
+    wordExportBtn,
+    docxImportBtn,
+    confluenceImportBtn,
+    confluenceSearchBtn,
+    printBtn,
+  );
 
   const status = el("div", "mv-status");
   const toolbarStatus = el("div", "mv-toolbar__status");
@@ -477,7 +533,7 @@ export async function bootstrap() {
   toolbarTop.append(toolbarPrimary, actions);
 
   const toolbarInner = el("div", "mv-toolbar__inner");
-  toolbarInner.append(fileField, toolbarTop, toolbarStatus);
+  toolbarInner.append(fileField, mobileTopbar, toolbarTop, toolbarStatus);
   toolbar.append(toolbarInner);
 
   const ribbon = el("aside", "mv-ribbon");
@@ -638,15 +694,19 @@ export async function bootstrap() {
   const groupDoc = el("div", "mv-ribbon-group");
   groupDoc.append(el("span", "mv-ribbon-group-label", "Document"));
   const docTools = el("div", "mv-ribbon-tools");
+  const saveDocBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Opslaan");
+  saveDocBtn.type = "button";
+  saveDocBtn.title =
+    "Sla het geopende document handmatig op. Bij Confluence schrijft dit een nieuwe Confluence-versie; autosave naar Confluence staat uit.";
   const discardBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Herstellen");
   discardBtn.type = "button";
   discardBtn.title =
-    "Tekst terugzetten naar de laatst naar schijf geschreven versie (sinds laatste automatische opslag).";
+    "Tekst terugzetten naar de laatst opgeslagen of geïmporteerde versie.";
   const sourceToggleBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Markdown");
   sourceToggleBtn.type = "button";
   sourceToggleBtn.title = "Ruwe markdown tonen en bewerken. Keer terug met Weergave.";
   sourceToggleBtn.setAttribute("aria-pressed", "false");
-  docTools.append(discardBtn, el("span", "mv-ribbon-sep"), sourceToggleBtn);
+  docTools.append(saveDocBtn, discardBtn, el("span", "mv-ribbon-sep"), sourceToggleBtn);
   groupDoc.append(docTools);
 
   ribbonBody.append(groupStyle, groupLists, groupTable, groupInsert, groupReview, groupDoc);
@@ -669,7 +729,10 @@ export async function bootstrap() {
   const agentChatClearBtn = el("button", "mv-agent-chat-clear mv-ribbon-btn mv-ribbon-btn--ghost", "Wissen");
   agentChatClearBtn.type = "button";
   agentChatClearBtn.title = "Chatgeschiedenis in dit paneel leegmaken";
-  agentChatTitleRow.append(agentChatTitle, agentChatClearBtn);
+  const agentChatCloseBtn = el("button", "mv-agent-chat-close", "Sluiten");
+  agentChatCloseBtn.type = "button";
+  agentChatCloseBtn.setAttribute("aria-label", "Agent-overlay sluiten");
+  agentChatTitleRow.append(agentChatTitle, agentChatClearBtn, agentChatCloseBtn);
   const agentChatSessionRow = el("div", "mv-agent-chat-session-row");
   const agentChatSessionSelect = document.createElement("select");
   agentChatSessionSelect.className = "mv-agent-chat-session-select";
@@ -740,7 +803,21 @@ export async function bootstrap() {
   const agentCorpusRefreshBtn = el("button", "mv-agent-chat-session-btn", "Ververs corpus");
   agentCorpusRefreshBtn.type = "button";
   agentCorpusRefreshBtn.title = "Herbouw de werkdocument- en memory-index en ververs de corpusinformatie";
-  agentMemoryToolsRow.append(agentChatPromoteBtn, agentChatPromoteStaleBtn, agentMemoryToggleBtn, agentCorpusRefreshBtn);
+  const agentSecondBrainBtn = el("button", "mv-agent-chat-session-btn", "Second brain");
+  agentSecondBrainBtn.type = "button";
+  agentSecondBrainBtn.title = "Toon metadata-, backlink- en mention-samenvatting van de second-brain index";
+  const agentAskToAgentBtn = el("button", "mv-agent-chat-session-btn", "Ask → Agent");
+  agentAskToAgentBtn.type = "button";
+  agentAskToAgentBtn.title =
+    "Gebruik het laatste Ask-antwoord als basis voor een Agent-instructie om het open document reviewbaar aan te passen";
+  agentMemoryToolsRow.append(
+    agentChatPromoteBtn,
+    agentChatPromoteStaleBtn,
+    agentMemoryToggleBtn,
+    agentCorpusRefreshBtn,
+    agentSecondBrainBtn,
+    agentAskToAgentBtn,
+  );
   agentChatHead.append(
     agentChatTitleRow,
     agentChatSessionRow,
@@ -780,6 +857,26 @@ export async function bootstrap() {
   function formatCorpusActivityLine(ev: CorpusActivityEvent): string {
     if (ev.phase === "read_file" && ev.path) {
       let s = `Bestand lezen: ${ev.path}`;
+      if (ev.detail) s += ` — ${ev.detail}`;
+      return s;
+    }
+    if (ev.phase === "read_outline" && ev.path) {
+      let s = `Koppen lezen: ${ev.path}`;
+      if (ev.detail) s += ` — ${ev.detail}`;
+      return s;
+    }
+    if (ev.phase === "read_section" && ev.path) {
+      let s = `Sectie lezen: ${ev.path}`;
+      if (ev.detail) s += ` — ${ev.detail}`;
+      return s;
+    }
+    if (ev.phase === "read_memory_outline" && ev.path) {
+      let s = `Memory-koppen lezen: ${ev.path}`;
+      if (ev.detail) s += ` — ${ev.detail}`;
+      return s;
+    }
+    if (ev.phase === "read_memory_section" && ev.path) {
+      let s = `Memory-sectie lezen: ${ev.path}`;
       if (ev.detail) s += ` — ${ev.detail}`;
       return s;
     }
@@ -825,6 +922,49 @@ export async function bootstrap() {
       agentChatActivityStrip.removeChild(agentChatActivityStrip.firstChild!);
     }
     agentSidebarScroll.scrollTop = agentSidebarScroll.scrollHeight;
+  }
+
+  function formatMetricNumber(n: number | undefined): string {
+    return typeof n === "number" && Number.isFinite(n) ? new Intl.NumberFormat("nl-NL").format(Math.round(n)) : "n/a";
+  }
+
+  function formatDurationMs(ms: number | undefined): string {
+    if (typeof ms !== "number" || !Number.isFinite(ms)) return "n/a";
+    return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s` : `${Math.round(ms)}ms`;
+  }
+
+  function formatAgentPerformanceMetrics(metrics?: AgentPerformanceMetrics): string {
+    if (!metrics) return "";
+    const totalTokens = metrics.tokenUsage?.totalTokens;
+    const tokenPart =
+      typeof totalTokens === "number" && totalTokens > 0
+        ? `${formatMetricNumber(totalTokens)} tokens`
+        : `~${formatMetricNumber(metrics.approxContextTokens)} contexttokens`;
+    const retrievedPart =
+      typeof metrics.approxRetrievedTokens === "number" && metrics.approxRetrievedTokens > 0
+        ? `~${formatMetricNumber(metrics.approxRetrievedTokens)} opgehaalde tokens`
+        : "geen extra documenttokens";
+    return [
+      `Totaal ${formatDurationMs(metrics.durationMs)}`,
+      `LLM ${formatDurationMs(metrics.llmMs)} (${formatMetricNumber(metrics.llmCallCount)} call(s))`,
+      `${formatMetricNumber(metrics.toolCallCount)} toolactie(s)`,
+      tokenPart,
+      retrievedPart,
+    ].join(" · ");
+  }
+
+  function pushPerformanceMetricsRow(metrics?: AgentPerformanceMetrics): void {
+    const line = formatAgentPerformanceMetrics(metrics);
+    if (!line) return;
+    agentChatActivityStrip.hidden = false;
+    const row = el("div", "mv-agent-chat-activity-row mv-agent-chat-activity-row--metrics");
+    const dot = el("span", "mv-agent-chat-activity-dot");
+    const tx = el("span", "mv-agent-chat-activity-text", `Metrics: ${line}`);
+    row.append(dot, tx);
+    agentChatActivityStrip.append(row);
+    while (agentChatActivityStrip.childElementCount > 14) {
+      agentChatActivityStrip.removeChild(agentChatActivityStrip.firstChild!);
+    }
   }
 
   const agentChatLlmDebug = el("div", "mv-agent-llm-debug");
@@ -874,9 +1014,16 @@ export async function bootstrap() {
   }
   agentChatInputWrap.append(agentChatInput, agentChatMicBtn);
   const agentChatActions = el("div", "mv-agent-chat-actions");
+  const meetingReportBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Gespreksverslag");
+  meetingReportBtn.type = "button";
+  meetingReportBtn.title =
+    "Plak een transcript en laat de Agent een gespreksverslag in het geopende document plaatsen.";
+  const promptMacroBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Macro");
+  promptMacroBtn.type = "button";
+  promptMacroBtn.title = "Kies, maak of beheer een herbruikbare promptmacro.";
   const agentChatSendBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Verzend");
   agentChatSendBtn.type = "button";
-  agentChatActions.append(agentChatSendBtn);
+  agentChatActions.append(promptMacroBtn, meetingReportBtn, agentChatSendBtn);
   agentChatComposer.append(agentChatInputWrap, agentChatActions);
 
   async function cleanupAgentChatSpeechTranscript(prefix: string, rawSpeech: string): Promise<void> {
@@ -1033,16 +1180,63 @@ export async function bootstrap() {
     agentChatComposer,
   );
 
+  const mobileBackdrop = el("button", "mv-mobile-backdrop");
+  mobileBackdrop.type = "button";
+  mobileBackdrop.setAttribute("aria-label", "Mobiele overlay sluiten");
+  mobileBackdrop.hidden = true;
+
+  const mobileMenu = el("nav", "mv-mobile-menu");
+  mobileMenu.hidden = true;
+  mobileMenu.setAttribute("aria-label", "Mobiel menu");
+  const mobileMenuHead = el("div", "mv-mobile-menu-head");
+  mobileMenuHead.append(el("strong", "", "Menu"));
+  const mobileMenuCloseBtn = el("button", "mv-mobile-menu-close", "Sluiten");
+  mobileMenuCloseBtn.type = "button";
+  mobileMenuHead.append(mobileMenuCloseBtn);
+  const mobileMenuActions = el("div", "mv-mobile-menu-actions");
+  const makeMobileMenuButton = (label: string, run: () => void) => {
+    const btn = el("button", "mv-mobile-menu-action", label);
+    btn.type = "button";
+    btn.addEventListener("click", () => {
+      closeMobileOverlays();
+      run();
+    });
+    return btn;
+  };
+  mobileMenuActions.append(
+    makeMobileMenuButton("Openen…", () => browseFilesBtn.click()),
+    makeMobileMenuButton("Plakken", () => pasteMdBtn.click()),
+    makeMobileMenuButton("Instellingen", () => settingsBtn.click()),
+    makeMobileMenuButton("Word export", () => wordExportBtn.click()),
+    makeMobileMenuButton("Word naar Markdown", () => docxImportBtn.click()),
+    makeMobileMenuButton("Confluence importeren", () => confluenceImportBtn.click()),
+    makeMobileMenuButton("Zoek Confluence", () => confluenceSearchBtn.click()),
+    makeMobileMenuButton("Afdrukken", () => printBtn.click()),
+    makeMobileMenuButton("Opslaan", () => saveDocBtn.click()),
+    makeMobileMenuButton("Herstellen", () => discardBtn.click()),
+    makeMobileMenuButton("Markdown-bron", () => sourceToggleBtn.click()),
+  );
+  mobileMenu.append(mobileMenuHead, mobileMenuActions);
+
+  const mobileChatLauncher = el("button", "mv-mobile-chat-launcher", "Agent");
+  mobileChatLauncher.type = "button";
+  mobileChatLauncher.setAttribute("aria-label", "Agent-chat openen");
+
   const fileTreePanel = el("aside", "mv-file-tree");
   fileTreePanel.setAttribute("aria-label", "Markdown-bestanden");
   const fileTreeHead = el("div", "mv-file-tree-head");
+  const fileTreeTitleRow = el("div", "mv-file-tree-title-row");
   const fileTreeTitle = el("h2", "mv-file-tree-title", "Bestanden");
+  const fileTreeCloseBtn = el("button", "mv-file-tree-close", "Sluiten");
+  fileTreeCloseBtn.type = "button";
+  fileTreeCloseBtn.setAttribute("aria-label", "Bestandsboom sluiten");
   const fileTreeFilter = document.createElement("input");
   fileTreeFilter.type = "search";
   fileTreeFilter.className = "mv-file-tree-filter";
   fileTreeFilter.placeholder = "Filter…";
   fileTreeFilter.setAttribute("aria-label", "Filter bestandslijst");
-  fileTreeHead.append(fileTreeTitle, fileTreeFilter);
+  fileTreeTitleRow.append(fileTreeTitle, fileTreeCloseBtn);
+  fileTreeHead.append(fileTreeTitleRow, fileTreeFilter);
   const fileTreeScroll = el("div", "mv-file-tree-scroll");
   fileTreePanel.append(fileTreeHead, fileTreeScroll);
 
@@ -1066,7 +1260,7 @@ export async function bootstrap() {
 
   bodyWrap.append(fileTreePanel, treePaneResizer, main, agentPaneResizer, agentChatPanel);
 
-  shell.append(toolbar, ribbon, bodyWrap);
+  shell.append(toolbar, ribbon, bodyWrap, mobileBackdrop, mobileMenu, mobileChatLauncher);
   app.append(shell);
 
   const AGENT_PANE_WIDTH_STORAGE_KEY = "mv.agentPaneWidthPx";
@@ -1077,6 +1271,54 @@ export async function bootstrap() {
   const TREE_PANE_MIN_PX = 180;
   const AGENT_PANE_DOC_MIN_PX = 280;
   const BODY_PANE_RESIZER_WIDTH = 6;
+  const MOBILE_LAYOUT_QUERY = "(max-width: 760px)";
+  const mobileLayoutMq = window.matchMedia(MOBILE_LAYOUT_QUERY);
+
+  function setMobileBackdropVisible(visible: boolean): void {
+    mobileBackdrop.hidden = !visible;
+  }
+
+  function syncMobileOverlayState(): void {
+    const anyOpen =
+      shell.classList.contains("is-mobile-menu-open") ||
+      shell.classList.contains("is-mobile-file-tree-open") ||
+      shell.classList.contains("is-mobile-chat-open");
+    setMobileBackdropVisible(mobileLayoutMq.matches && anyOpen);
+    mobileMenu.hidden = !shell.classList.contains("is-mobile-menu-open");
+    mobileFileTreeBtn.setAttribute("aria-expanded", shell.classList.contains("is-mobile-file-tree-open") ? "true" : "false");
+    mobileChatBtn.setAttribute("aria-expanded", shell.classList.contains("is-mobile-chat-open") ? "true" : "false");
+    mobileChatLauncher.setAttribute("aria-expanded", shell.classList.contains("is-mobile-chat-open") ? "true" : "false");
+    mobileMenuBtn.setAttribute("aria-expanded", shell.classList.contains("is-mobile-menu-open") ? "true" : "false");
+  }
+
+  function closeMobileOverlays(): void {
+    shell.classList.remove("is-mobile-menu-open", "is-mobile-file-tree-open", "is-mobile-chat-open");
+    syncMobileOverlayState();
+  }
+
+  function openMobileMenu(): void {
+    shell.classList.remove("is-mobile-file-tree-open", "is-mobile-chat-open");
+    shell.classList.add("is-mobile-menu-open");
+    syncMobileOverlayState();
+  }
+
+  function openMobileFileTree(): void {
+    shell.classList.remove("is-mobile-menu-open", "is-mobile-chat-open");
+    shell.classList.add("is-mobile-file-tree-open");
+    syncMobileOverlayState();
+    requestAnimationFrame(() => fileTreeFilter.focus());
+  }
+
+  function toggleMobileChat(): void {
+    shell.classList.remove("is-mobile-menu-open", "is-mobile-file-tree-open");
+    shell.classList.toggle("is-mobile-chat-open");
+    syncMobileOverlayState();
+    if (shell.classList.contains("is-mobile-chat-open")) {
+      requestAnimationFrame(() => agentChatInput.focus());
+    }
+  }
+
+  syncMobileOverlayState();
 
   function readStoredAgentPaneWidth(): number {
     try {
@@ -1350,6 +1592,250 @@ export async function bootstrap() {
   let renameSourcePath: string | null = null;
   let renameIsExternal = false;
 
+  const meetingReportDialog = el("div", "mv-md-dialog");
+  meetingReportDialog.hidden = true;
+  meetingReportDialog.setAttribute("role", "dialog");
+  meetingReportDialog.setAttribute("aria-modal", "true");
+  meetingReportDialog.setAttribute("aria-label", "Gespreksverslag maken");
+  const meetingReportCard = el("div", "mv-md-dialog-card");
+  const meetingReportTitle = el("h2", "mv-md-dialog-title", "Gespreksverslag maken");
+  const meetingReportHint = el(
+    "div",
+    "mv-md-dialog-hint",
+    "Plak hieronder het transcript. Na bevestigen stuurt de Agent een opdracht om het gespreksverslag in het geopende document te plaatsen.",
+  );
+  const meetingReportTranscriptLabel = el("label", "mv-md-dialog-label", "Transcript");
+  meetingReportTranscriptLabel.setAttribute("for", "mv-meeting-report-transcript");
+  const meetingReportTranscript = document.createElement("textarea");
+  meetingReportTranscript.id = "mv-meeting-report-transcript";
+  meetingReportTranscript.className = "mv-md-dialog-textarea";
+  meetingReportTranscript.placeholder = "Plak hier het transcript van het gesprek...";
+  const meetingReportActions = el("div", "mv-md-dialog-actions");
+  const meetingReportCancelBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Annuleren");
+  meetingReportCancelBtn.type = "button";
+  const meetingReportSubmitBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Gespreksverslag maken");
+  meetingReportSubmitBtn.type = "button";
+  meetingReportActions.append(meetingReportCancelBtn, meetingReportSubmitBtn);
+  meetingReportCard.append(
+    meetingReportTitle,
+    meetingReportHint,
+    meetingReportTranscriptLabel,
+    meetingReportTranscript,
+    meetingReportActions,
+  );
+  meetingReportDialog.append(meetingReportCard);
+  document.body.append(meetingReportDialog);
+
+  const promptMacroDialog = el("div", "mv-md-dialog mv-prompt-macro-dialog");
+  promptMacroDialog.hidden = true;
+  promptMacroDialog.setAttribute("role", "dialog");
+  promptMacroDialog.setAttribute("aria-modal", "true");
+  promptMacroDialog.setAttribute("aria-label", "Promptmacro's");
+  const promptMacroCard = el("div", "mv-md-dialog-card mv-prompt-macro-card");
+  const promptMacroTitle = el("h2", "mv-md-dialog-title", "Promptmacro's");
+  const promptMacroHint = el(
+    "div",
+    "mv-md-dialog-hint",
+    "Maak herbruikbare opdrachten voor Agent of Ask. Een macro bestaat uit een vaste prompt en kan optioneel aanvullende inhoud vragen, zoals een transcript.",
+  );
+  const promptMacroSelectLabel = el("label", "mv-md-dialog-label", "Macro");
+  promptMacroSelectLabel.setAttribute("for", "mv-prompt-macro-select");
+  const promptMacroSelect = document.createElement("select");
+  promptMacroSelect.id = "mv-prompt-macro-select";
+  promptMacroSelect.className = "mv-md-dialog-input";
+  const promptMacroManageActions = el("div", "mv-md-dialog-actions mv-prompt-macro-top-actions");
+  const promptMacroNewBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Nieuw");
+  promptMacroNewBtn.type = "button";
+  const promptMacroDeleteBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--danger", "Verwijderen");
+  promptMacroDeleteBtn.type = "button";
+  promptMacroManageActions.append(promptMacroNewBtn, promptMacroDeleteBtn);
+  const promptMacroNameLabel = el("label", "mv-md-dialog-label", "Naam");
+  promptMacroNameLabel.setAttribute("for", "mv-prompt-macro-name");
+  const promptMacroName = document.createElement("input");
+  promptMacroName.id = "mv-prompt-macro-name";
+  promptMacroName.className = "mv-md-dialog-input";
+  promptMacroName.type = "text";
+  promptMacroName.placeholder = "Bijv. Markdown pagina opschonen";
+  const promptMacroDescriptionLabel = el("label", "mv-md-dialog-label", "Omschrijving");
+  promptMacroDescriptionLabel.setAttribute("for", "mv-prompt-macro-description");
+  const promptMacroDescription = document.createElement("input");
+  promptMacroDescription.id = "mv-prompt-macro-description";
+  promptMacroDescription.className = "mv-md-dialog-input";
+  promptMacroDescription.type = "text";
+  promptMacroDescription.placeholder = "Korte omschrijving voor jezelf";
+  const promptMacroModeLabel = el("label", "mv-md-dialog-label", "Modus");
+  promptMacroModeLabel.setAttribute("for", "mv-prompt-macro-mode");
+  const promptMacroMode = document.createElement("select");
+  promptMacroMode.id = "mv-prompt-macro-mode";
+  promptMacroMode.className = "mv-md-dialog-input";
+  for (const [value, label] of [
+    ["agent", "Agent - past het document aan"],
+    ["ask", "Ask - beantwoordt alleen in chat"],
+  ] as const) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    promptMacroMode.append(opt);
+  }
+  const promptMacroRequiresContentLabel = el("label", "mv-md-dialog-label mv-agent-debug-llm-label");
+  const promptMacroRequiresContent = document.createElement("input");
+  promptMacroRequiresContent.type = "checkbox";
+  promptMacroRequiresContent.id = "mv-prompt-macro-requires-content";
+  promptMacroRequiresContentLabel.htmlFor = promptMacroRequiresContent.id;
+  promptMacroRequiresContentLabel.append(
+    promptMacroRequiresContent,
+    document.createTextNode(" Macro vraagt aanvullende inhoud bij uitvoeren"),
+  );
+  const promptMacroContentLabelLabel = el("label", "mv-md-dialog-label", "Label aanvullende inhoud");
+  promptMacroContentLabelLabel.setAttribute("for", "mv-prompt-macro-content-label");
+  const promptMacroContentLabel = document.createElement("input");
+  promptMacroContentLabel.id = "mv-prompt-macro-content-label";
+  promptMacroContentLabel.className = "mv-md-dialog-input";
+  promptMacroContentLabel.type = "text";
+  promptMacroContentLabel.placeholder = "Bijv. Transcript";
+  const promptMacroContentPrefixLabel = el("label", "mv-md-dialog-label", "Kopje voor aanvullende inhoud in prompt");
+  promptMacroContentPrefixLabel.setAttribute("for", "mv-prompt-macro-content-prefix");
+  const promptMacroContentPrefix = document.createElement("input");
+  promptMacroContentPrefix.id = "mv-prompt-macro-content-prefix";
+  promptMacroContentPrefix.className = "mv-md-dialog-input";
+  promptMacroContentPrefix.type = "text";
+  promptMacroContentPrefix.placeholder = "Bijv. Transcript:";
+  const promptMacroPromptLabel = el("label", "mv-md-dialog-label", "Vaste prompt");
+  promptMacroPromptLabel.setAttribute("for", "mv-prompt-macro-prompt");
+  const promptMacroPrompt = document.createElement("textarea");
+  promptMacroPrompt.id = "mv-prompt-macro-prompt";
+  promptMacroPrompt.className = "mv-md-dialog-textarea mv-prompt-macro-prompt";
+  promptMacroPrompt.rows = 10;
+  promptMacroPrompt.placeholder = "Beschrijf hier de vaste opdracht...";
+  const promptMacroRunContentLabel = el("label", "mv-md-dialog-label", "Aanvullende inhoud voor deze uitvoering");
+  promptMacroRunContentLabel.setAttribute("for", "mv-prompt-macro-run-content");
+  const promptMacroRunContent = document.createElement("textarea");
+  promptMacroRunContent.id = "mv-prompt-macro-run-content";
+  promptMacroRunContent.className = "mv-md-dialog-textarea mv-prompt-macro-run-content";
+  promptMacroRunContent.rows = 6;
+  promptMacroRunContent.placeholder = "Optioneel of verplicht, afhankelijk van de macro...";
+  const promptMacroActions = el("div", "mv-md-dialog-actions");
+  const promptMacroCloseBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Sluiten");
+  promptMacroCloseBtn.type = "button";
+  const promptMacroSaveBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Macro opslaan");
+  promptMacroSaveBtn.type = "button";
+  const promptMacroRunBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Uitvoeren");
+  promptMacroRunBtn.type = "button";
+  promptMacroActions.append(promptMacroCloseBtn, promptMacroSaveBtn, promptMacroRunBtn);
+  promptMacroCard.append(
+    promptMacroTitle,
+    promptMacroHint,
+    promptMacroSelectLabel,
+    promptMacroSelect,
+    promptMacroManageActions,
+    promptMacroNameLabel,
+    promptMacroName,
+    promptMacroDescriptionLabel,
+    promptMacroDescription,
+    promptMacroModeLabel,
+    promptMacroMode,
+    promptMacroRequiresContentLabel,
+    promptMacroContentLabelLabel,
+    promptMacroContentLabel,
+    promptMacroContentPrefixLabel,
+    promptMacroContentPrefix,
+    promptMacroPromptLabel,
+    promptMacroPrompt,
+    promptMacroRunContentLabel,
+    promptMacroRunContent,
+    promptMacroActions,
+  );
+  promptMacroDialog.append(promptMacroCard);
+  document.body.append(promptMacroDialog);
+  let promptMacroEditingId = "";
+
+  const confluenceImportDialog = el("div", "mv-md-dialog");
+  confluenceImportDialog.hidden = true;
+  confluenceImportDialog.setAttribute("role", "dialog");
+  confluenceImportDialog.setAttribute("aria-modal", "true");
+  confluenceImportDialog.setAttribute("aria-label", "Confluence-pagina importeren");
+  const confluenceImportCard = el("div", "mv-md-dialog-card");
+  const confluenceImportTitle = el("h2", "mv-md-dialog-title", "Confluence-pagina importeren");
+  const confluenceImportHint = el(
+    "div",
+    "mv-md-dialog-hint",
+    "Plak een Confluence URL of numerieke pageId. De pagina wordt tijdelijk als Markdown geopend; handmatig opslaan schrijft een nieuwe versie terug naar Confluence.",
+  );
+  const confluenceImportLabel = el("label", "mv-md-dialog-label", "Confluence URL of pageId");
+  confluenceImportLabel.setAttribute("for", "mv-confluence-import-input");
+  const confluenceImportInput = document.createElement("input");
+  confluenceImportInput.id = "mv-confluence-import-input";
+  confluenceImportInput.className = "mv-md-dialog-input";
+  confluenceImportInput.type = "text";
+  confluenceImportInput.placeholder = "https://confluence.../display/SPACE/Page+Title of 123456";
+  const confluenceImportActions = el("div", "mv-md-dialog-actions");
+  const confluenceImportCancelBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Annuleren");
+  confluenceImportCancelBtn.type = "button";
+  const confluenceImportRunBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Importeren");
+  confluenceImportRunBtn.type = "button";
+  confluenceImportActions.append(confluenceImportCancelBtn, confluenceImportRunBtn);
+  confluenceImportCard.append(
+    confluenceImportTitle,
+    confluenceImportHint,
+    confluenceImportLabel,
+    confluenceImportInput,
+    confluenceImportActions,
+  );
+  confluenceImportDialog.append(confluenceImportCard);
+  document.body.append(confluenceImportDialog);
+
+  const confluenceSearchDialog = el("div", "mv-md-dialog");
+  confluenceSearchDialog.hidden = true;
+  confluenceSearchDialog.setAttribute("role", "dialog");
+  confluenceSearchDialog.setAttribute("aria-modal", "true");
+  confluenceSearchDialog.setAttribute("aria-label", "Zoek in Confluence");
+  const confluenceSearchCard = el("div", "mv-md-dialog-card mv-confluence-search-card");
+  const confluenceSearchTitle = el("h2", "mv-md-dialog-title", "Zoek in Confluence");
+  const confluenceSearchHint = el(
+    "div",
+    "mv-md-dialog-hint",
+    "Zoek op titel of inhoud. Kies een resultaat om de pagina tijdelijk in de editor te importeren.",
+  );
+  const confluenceSearchQueryLabel = el("label", "mv-md-dialog-label", "Zoekterm");
+  confluenceSearchQueryLabel.setAttribute("for", "mv-confluence-search-query");
+  const confluenceSearchQueryInput = document.createElement("input");
+  confluenceSearchQueryInput.id = "mv-confluence-search-query";
+  confluenceSearchQueryInput.className = "mv-md-dialog-input";
+  confluenceSearchQueryInput.type = "search";
+  confluenceSearchQueryInput.placeholder = "Bijvoorbeeld: Problem Management";
+  const confluenceSearchOptions = el("div", "mv-confluence-search-options");
+  const confluenceSearchSpaceInput = document.createElement("input");
+  confluenceSearchSpaceInput.className = "mv-md-dialog-input";
+  confluenceSearchSpaceInput.type = "text";
+  confluenceSearchSpaceInput.placeholder = "Space key optioneel";
+  confluenceSearchSpaceInput.setAttribute("aria-label", "Confluence space key");
+  const confluenceSearchLimitInput = document.createElement("input");
+  confluenceSearchLimitInput.className = "mv-md-dialog-input";
+  confluenceSearchLimitInput.type = "number";
+  confluenceSearchLimitInput.min = "1";
+  confluenceSearchLimitInput.max = "50";
+  confluenceSearchLimitInput.value = "10";
+  confluenceSearchLimitInput.setAttribute("aria-label", "Aantal resultaten");
+  confluenceSearchOptions.append(confluenceSearchSpaceInput, confluenceSearchLimitInput);
+  const confluenceSearchResults = el("div", "mv-confluence-search-results");
+  const confluenceSearchActions = el("div", "mv-md-dialog-actions");
+  const confluenceSearchCancelBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Sluiten");
+  confluenceSearchCancelBtn.type = "button";
+  const confluenceSearchRunBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Zoeken");
+  confluenceSearchRunBtn.type = "button";
+  confluenceSearchActions.append(confluenceSearchCancelBtn, confluenceSearchRunBtn);
+  confluenceSearchCard.append(
+    confluenceSearchTitle,
+    confluenceSearchHint,
+    confluenceSearchQueryLabel,
+    confluenceSearchQueryInput,
+    confluenceSearchOptions,
+    confluenceSearchResults,
+    confluenceSearchActions,
+  );
+  confluenceSearchDialog.append(confluenceSearchCard);
+  document.body.append(confluenceSearchDialog);
+
   const settingsDialog = el("div", "mv-md-dialog mv-settings-dialog");
   settingsDialog.hidden = true;
   settingsDialog.setAttribute("role", "dialog");
@@ -1526,6 +2012,7 @@ export async function bootstrap() {
   coverSection.hidden = true;
   const tocHost = el("div", "mv-toc-host");
   const proseHost = el("div", "mv-prose-host");
+  attachLocalMarkdownLinkHandler(proseHost);
 
   const endSection = el("section", "mv-end");
   endSection.hidden = true;
@@ -1595,8 +2082,10 @@ export async function bootstrap() {
     } catch {
       /* private mode */
     }
+    externalDocumentKind = "none";
     externalFileHandle = null;
     externalFileLabel = "";
+    externalConfluencePage = null;
   }
 
   function getOrCreateExternalAgentVirtualName(): string {
@@ -1632,6 +2121,12 @@ export async function bootstrap() {
     return await file.text();
   }
 
+  function externalDocumentSourceLabel(): string {
+    if (externalDocumentKind === "confluence") return "Confluence";
+    if (externalDocumentKind === "disk") return "schijf";
+    return "extern";
+  }
+
   async function writeExternalMarkdownDisk(content: string): Promise<void> {
     if (!externalFileHandle) throw new Error("Geen extern bestand");
     const fh = externalFileHandle as FileSystemFileHandle & {
@@ -1656,6 +2151,30 @@ export async function bootstrap() {
     const w = await externalFileHandle.createWritable();
     await w.write(content);
     await w.close();
+  }
+
+  async function writeExternalMarkdown(content: string): Promise<void> {
+    if (externalDocumentKind === "confluence") {
+      if (!externalConfluencePage) throw new Error("Geen Confluence-pagina gekoppeld");
+      const saved = await saveConfluencePage({
+        pageId: externalConfluencePage.id,
+        title: externalConfluencePage.title,
+        baseVersion: externalConfluencePage.version,
+        markdown: content,
+      });
+      externalConfluencePage = {
+        ...externalConfluencePage,
+        title: saved.title || externalConfluencePage.title,
+        version: saved.version,
+        url: saved.url || externalConfluencePage.url,
+      };
+      externalFileLabel = externalConfluencePage.title;
+      const opt = Array.from(fileSelect.options).find((o) => o.value === EXTERNAL_MARKDOWN_VALUE);
+      if (opt) opt.textContent = `☁ ${externalFileLabel} (Confluence v${externalConfluencePage.version})`;
+      syncToolbarDocTitle();
+      return;
+    }
+    await writeExternalMarkdownDisk(content);
   }
 
   async function confirmLeaveEditModeForImport(): Promise<boolean> {
@@ -1700,6 +2219,191 @@ export async function bootstrap() {
 
   function hideMarkdownStringDialog() {
     mdStringDialog.hidden = true;
+  }
+
+  function showMeetingReportDialog() {
+    if (!getAgentChatDocumentName()) {
+      status.textContent = "Selecteer of open eerst een document voor het gespreksverslag.";
+      return;
+    }
+    meetingReportTranscript.value = "";
+    meetingReportDialog.hidden = false;
+    meetingReportTranscript.focus();
+  }
+
+  function hideMeetingReportDialog() {
+    meetingReportDialog.hidden = true;
+  }
+
+  function buildMeetingReportPrompt(transcript: string): string {
+    return `Maak op basis van onderstaand transcript een gespreksverslag en plaats dit in het huidige Markdown-document.
+
+Vereisten:
+- Begin met een korte samenvatting.
+- Maak een kopje per besproken onderwerp.
+- Leg duidelijke afspraken en acties vast, inclusief eigenaar/personen en data.
+- Formuleer acties zo SMART mogelijk: Specifiek, Meetbaar, Aanwijsbaar, Realistisch en Tijdsgebonden.
+- Gebruik Markdown die past bij de stijl van het huidige document.
+- Herhaal het transcript niet letterlijk; verwerk alleen de relevante inhoud in het verslag.
+- Voeg het verslag logisch in het document in. Vervang bestaande inhoud alleen als dat duidelijk de bedoeling is.
+
+Transcript:
+${transcript}`;
+  }
+
+  async function submitMeetingReportTranscript() {
+    const transcript = meetingReportTranscript.value.trim();
+    if (!transcript) {
+      status.textContent = "Plak eerst een transcript voor het gespreksverslag.";
+      meetingReportTranscript.focus();
+      return;
+    }
+    hideMeetingReportDialog();
+    agentChatMode = "agent";
+    refreshAgentChatModeUi();
+    agentChatInput.value = buildMeetingReportPrompt(transcript);
+    await submitAgentChat();
+  }
+
+  function renderPromptMacroOptions(selectedId = promptMacroEditingId): void {
+    promptMacroSelect.replaceChildren();
+    for (const macro of promptMacros) {
+      const opt = document.createElement("option");
+      opt.value = macro.id;
+      opt.textContent = macro.name;
+      promptMacroSelect.append(opt);
+    }
+    if (selectedId && promptMacros.some((m) => m.id === selectedId)) {
+      promptMacroSelect.value = selectedId;
+    } else if (promptMacros[0]) {
+      promptMacroSelect.value = promptMacros[0].id;
+    }
+  }
+
+  function selectedPromptMacro(): PromptMacro | null {
+    return promptMacros.find((m) => m.id === promptMacroSelect.value) || null;
+  }
+
+  function fillPromptMacroForm(macro: PromptMacro | null): void {
+    promptMacroEditingId = macro?.id || "";
+    promptMacroName.value = macro?.name || "";
+    promptMacroDescription.value = macro?.description || "";
+    promptMacroMode.value = macro?.mode || "agent";
+    promptMacroRequiresContent.checked = macro?.requiresContent === true;
+    promptMacroContentLabel.value = macro?.contentLabel || "Aanvullende inhoud";
+    promptMacroContentPrefix.value = macro?.contentPrefix || "Aanvullende inhoud:";
+    promptMacroPrompt.value = macro?.prompt || "";
+    promptMacroRunContent.value = "";
+    promptMacroRunContentLabel.textContent = macro?.contentLabel
+      ? `${macro.contentLabel} voor deze uitvoering`
+      : "Aanvullende inhoud voor deze uitvoering";
+    promptMacroRunContent.placeholder = macro?.contentPlaceholder || "Optioneel of verplicht, afhankelijk van de macro...";
+    promptMacroDeleteBtn.disabled = !macro;
+  }
+
+  async function reloadPromptMacros(selectedId = promptMacroEditingId): Promise<void> {
+    const payload = await fetchPromptMacros();
+    promptMacros = payload.macros;
+    renderPromptMacroOptions(selectedId);
+    fillPromptMacroForm(selectedPromptMacro());
+  }
+
+  async function showPromptMacroDialog(): Promise<void> {
+    promptMacroDialog.hidden = false;
+    try {
+      await reloadPromptMacros();
+      promptMacroSelect.focus();
+      status.textContent = promptMacros.length
+        ? `${promptMacros.length} promptmacro('s) geladen.`
+        : "Nog geen promptmacro's gevonden.";
+    } catch (e) {
+      status.textContent = `Promptmacro's laden mislukt: ${String((e as Error).message)}`;
+    }
+  }
+
+  function hidePromptMacroDialog(): void {
+    promptMacroDialog.hidden = true;
+  }
+
+  function promptMacroFormPayload(): Partial<PromptMacro> {
+    return {
+      name: promptMacroName.value.trim(),
+      description: promptMacroDescription.value.trim(),
+      mode: promptMacroMode.value === "ask" ? "ask" : "agent",
+      prompt: promptMacroPrompt.value.trim(),
+      requiresContent: promptMacroRequiresContent.checked,
+      contentLabel: promptMacroContentLabel.value.trim() || "Aanvullende inhoud",
+      contentPlaceholder: promptMacroRunContent.placeholder.trim(),
+      contentPrefix: promptMacroContentPrefix.value.trim() || "Aanvullende inhoud:",
+    };
+  }
+
+  async function savePromptMacroFromForm(): Promise<void> {
+    const payload = promptMacroFormPayload();
+    if (!payload.name || !payload.prompt) {
+      status.textContent = "Macro opslaan mislukt: naam en vaste prompt zijn verplicht.";
+      return;
+    }
+    promptMacroSaveBtn.disabled = true;
+    try {
+      const result = promptMacroEditingId
+        ? await updatePromptMacro(promptMacroEditingId, payload)
+        : await createPromptMacro(payload);
+      promptMacros = result.macros;
+      const nextId = promptMacroEditingId || promptMacros.at(-1)?.id || "";
+      renderPromptMacroOptions(nextId);
+      fillPromptMacroForm(selectedPromptMacro());
+      status.textContent = "Promptmacro opgeslagen.";
+    } catch (e) {
+      status.textContent = `Promptmacro opslaan mislukt: ${String((e as Error).message)}`;
+    } finally {
+      promptMacroSaveBtn.disabled = false;
+    }
+  }
+
+  async function deleteSelectedPromptMacro(): Promise<void> {
+    const macro = selectedPromptMacro();
+    if (!macro) return;
+    if (!confirm(`Promptmacro "${macro.name}" verwijderen?`)) return;
+    promptMacroDeleteBtn.disabled = true;
+    try {
+      const result = await deletePromptMacro(macro.id);
+      promptMacros = result.macros;
+      renderPromptMacroOptions();
+      fillPromptMacroForm(selectedPromptMacro());
+      status.textContent = "Promptmacro verwijderd.";
+    } catch (e) {
+      status.textContent = `Promptmacro verwijderen mislukt: ${String((e as Error).message)}`;
+    } finally {
+      promptMacroDeleteBtn.disabled = false;
+    }
+  }
+
+  function buildPromptMacroMessage(macro: PromptMacro, content: string): string {
+    const base = macro.prompt.trim();
+    const extra = content.trim();
+    if (!extra) return base;
+    const prefix = macro.contentPrefix.trim() || macro.contentLabel.trim() || "Aanvullende inhoud:";
+    return `${base}\n\n${prefix}\n${extra}`;
+  }
+
+  async function runSelectedPromptMacro(): Promise<void> {
+    const macro = selectedPromptMacro();
+    if (!macro) {
+      status.textContent = "Kies eerst een promptmacro.";
+      return;
+    }
+    const content = promptMacroRunContent.value.trim();
+    if (macro.requiresContent && !content) {
+      status.textContent = `Vul eerst ${macro.contentLabel || "aanvullende inhoud"} in.`;
+      promptMacroRunContent.focus();
+      return;
+    }
+    hidePromptMacroDialog();
+    agentChatMode = macro.mode;
+    refreshAgentChatModeUi();
+    agentChatInput.value = buildPromptMacroMessage(macro, content);
+    await submitAgentChat();
   }
 
   async function refreshSettingsAgentLogs() {
@@ -1978,19 +2682,27 @@ export async function bootstrap() {
     const v = fileSelect.value.trim();
     if (!v) {
       toolbarDocName.textContent = "—";
+      mobileDocName.textContent = "—";
       toolbarDocName.removeAttribute("title");
-      renameMdBtn.disabled = true;
+      mobileDocName.removeAttribute("title");
       return;
     }
     if (v === EXTERNAL_MARKDOWN_VALUE) {
       toolbarDocName.textContent = externalFileLabel || "Extern";
-      toolbarDocName.title = externalFileLabel ? `Extern: ${externalFileLabel}` : "Extern bestand op schijf";
-      renameMdBtn.disabled = !externalFileHandle;
+      mobileDocName.textContent = externalFileLabel || "Extern";
+      toolbarDocName.title =
+        externalDocumentKind === "confluence" && externalConfluencePage?.url
+          ? `Confluence: ${externalConfluencePage.url}`
+          : externalFileLabel
+            ? `Extern: ${externalFileLabel}`
+            : "Extern bestand op schijf";
+      mobileDocName.title = toolbarDocName.title;
       return;
     }
     toolbarDocName.textContent = baseNameMd(v);
+    mobileDocName.textContent = baseNameMd(v);
     toolbarDocName.title = v;
-    renameMdBtn.disabled = false;
+    mobileDocName.title = v;
   }
 
   function computeRenameTarget(from: string, rawInput: string): string | null {
@@ -2028,13 +2740,17 @@ export async function bootstrap() {
     }
   }
 
-  function showRenameMarkdownDialog() {
-    const v = fileSelect.value.trim();
+  function showRenameMarkdownDialog(sourcePath?: string) {
+    const v = (sourcePath || fileSelect.value).trim();
     if (!v) {
       status.textContent = "Geen document geselecteerd.";
       return;
     }
     if (v === EXTERNAL_MARKDOWN_VALUE) {
+      if (externalDocumentKind === "confluence") {
+        status.textContent = "Confluence-pagina's hernoemen kan hier niet; alleen de inhoud wordt teruggeschreven.";
+        return;
+      }
       if (!externalFileHandle) {
         status.textContent = "Geen extern bestand gekoppeld — open opnieuw via Openen….";
         return;
@@ -2180,9 +2896,9 @@ export async function bootstrap() {
       currentMd = restored.content;
       if (name === EXTERNAL_MARKDOWN_VALUE) {
         try {
-          await writeExternalMarkdownDisk(restored.content);
+          await writeExternalMarkdown(restored.content);
         } catch (e) {
-          status.textContent = `Terugzetten op schijf mislukt: ${String((e as Error).message)}`;
+          status.textContent = `Terugzetten naar ${externalDocumentSourceLabel()} mislukt: ${String((e as Error).message)}`;
           return;
         }
       }
@@ -2330,9 +3046,13 @@ export async function bootstrap() {
     const code = editorSurfaceMode === "code";
     sourceToggleBtn.textContent = code ? "Weergave" : "Markdown";
     sourceToggleBtn.setAttribute("aria-pressed", code ? "true" : "false");
-    sourceToggleBtn.title = code
-      ? "Terug naar opgemaakte weergave."
-      : "Ruwe markdown tonen en bewerken.";
+    sourceToggleBtn.disabled = externalDocumentKind === "confluence";
+    sourceToggleBtn.title =
+      externalDocumentKind === "confluence"
+        ? "Ruwe Markdown is uitgeschakeld voor Confluence-pagina's, zodat macro-placeholders niet bewerkt worden."
+        : code
+          ? "Terug naar opgemaakte weergave."
+          : "Ruwe markdown tonen en bewerken.";
   }
 
   function refreshRibbonState() {
@@ -2683,7 +3403,7 @@ export async function bootstrap() {
         if (editorSurfaceMode === "code" && editorCodeTextarea) {
           const md = editorCodeTextarea.value;
           if (targetName === EXTERNAL_MARKDOWN_VALUE) {
-            await writeExternalMarkdownDisk(md);
+            await writeExternalMarkdown(md);
             currentMd = md;
             isDirty = false;
             const { reviewRelativePath } = await saveReviewComments(
@@ -2693,7 +3413,7 @@ export async function bootstrap() {
             const tplPart = templatesAvailable ? tplSelect.value : "geen templatebestanden";
             if (reason === "manual") {
               status.textContent =
-                `${externalFileLabel} — opgeslagen op schijf — commentaren: ${reviewRelativePath} — ${tplPart}`;
+                `${externalFileLabel} — opgeslagen naar ${externalDocumentSourceLabel()} — commentaren: ${reviewRelativePath} — ${tplPart}`;
             } else {
               const now = Date.now();
               if (now - lastAutoSaveOkAt > 2800) {
@@ -2730,7 +3450,7 @@ export async function bootstrap() {
         stripReviewHighlights(clone);
         const md = htmlFragmentToMarkdown(htmlFromEditRootForMarkdown(clone));
         if (targetName === EXTERNAL_MARKDOWN_VALUE) {
-          await writeExternalMarkdownDisk(md);
+            await writeExternalMarkdown(md);
           currentMd = md;
           isDirty = false;
           const { reviewRelativePath } = await saveReviewComments(
@@ -2740,7 +3460,7 @@ export async function bootstrap() {
           const tplPart = templatesAvailable ? tplSelect.value : "geen templatebestanden";
           if (reason === "manual") {
             status.textContent =
-              `${externalFileLabel} — opgeslagen op schijf — commentaren: ${reviewRelativePath} — ${tplPart}`;
+              `${externalFileLabel} — opgeslagen naar ${externalDocumentSourceLabel()} — commentaren: ${reviewRelativePath} — ${tplPart}`;
           } else {
             const now = Date.now();
             if (now - lastAutoSaveOkAt > 2800) {
@@ -2782,6 +3502,7 @@ export async function bootstrap() {
     isDirty = true;
     if (!editRoot) return;
     if (editorSurfaceMode === "visual" && hasChangeMarkers(editRoot)) return;
+    if (editorBoundDoc === EXTERNAL_MARKDOWN_VALUE && externalDocumentKind === "confluence") return;
     clearAutoSaveDebounce();
     const boundSnapshot = editorBoundDoc;
     autoSaveDebounceTimer = setTimeout(() => {
@@ -2874,6 +3595,8 @@ export async function bootstrap() {
     refreshRibbonState();
   }
 
+  saveDocBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  saveDocBtn.addEventListener("click", () => void forcePersistEditor());
   discardBtn.addEventListener("mousedown", (e) => e.preventDefault());
   discardBtn.addEventListener("click", () => void revertEditorToCurrentMd());
   sourceToggleBtn.addEventListener("mousedown", (e) => e.preventDefault());
@@ -2906,6 +3629,10 @@ export async function bootstrap() {
     agentChatPromoteStaleBtn.disabled = dis;
     agentMemoryToggleBtn.disabled = dis;
     agentCorpusRefreshBtn.disabled = dis;
+    agentSecondBrainBtn.disabled = dis;
+    agentAskToAgentBtn.disabled = dis || !lastAskAssistantReply();
+    promptMacroBtn.disabled = dis;
+    meetingReportBtn.disabled = dis;
     agentChatMicBtn.disabled = dis || !agentSpeechRecognitionAvailable;
     agentCorpusWideCheckbox.disabled = dis;
     agentWebSearchCheckbox.disabled = dis;
@@ -2957,6 +3684,8 @@ export async function bootstrap() {
     agentChatPromoteBtn.disabled = agentChatRequestBusy || sidebarReviewBusy || !activeAgentChatId;
     agentChatPromoteStaleBtn.disabled = agentChatRequestBusy || sidebarReviewBusy;
     agentCorpusRefreshBtn.disabled = agentChatRequestBusy || sidebarReviewBusy;
+    agentSecondBrainBtn.disabled = agentChatRequestBusy || sidebarReviewBusy;
+    agentAskToAgentBtn.disabled = agentChatRequestBusy || sidebarReviewBusy || !lastAskAssistantReply();
   }
 
   async function loadAgentChatSessions(): Promise<void> {
@@ -3129,6 +3858,82 @@ export async function bootstrap() {
     }
   }
 
+  async function showSecondBrainContextSummary(): Promise<void> {
+    setAgentChatRequestBusy(true);
+    status.textContent = "Second-brain context ophalen…";
+    try {
+      const ctx = await fetchSecondBrainContext();
+      const workingTags = Object.keys(ctx.working.tagCounts || {}).length;
+      const memoryTags = Object.keys(ctx.memory.tagCounts || {}).length;
+      const unlinked = await fetchSecondBrainUnlinkedMentions();
+      const workingMentions = unlinked.working.length;
+      const memoryMentions = unlinked.memory.length;
+      status.textContent =
+        `Second brain: ${ctx.working.entryCount} werkdocument(en), ${ctx.memory.entryCount} memory-document(en), ` +
+        `${ctx.working.metadataKeys.length + ctx.memory.metadataKeys.length} metadata-key(s), ` +
+        `${workingTags + memoryTags} tag(s), ${workingMentions + memoryMentions} mogelijke onverbonden mention(s).`;
+      if (unlinked.totalCount > 0) {
+        const examples = [...unlinked.working, ...unlinked.memory]
+          .slice(0, 5)
+          .map((item) => `- ${item.scope}: ${item.from} -> ${item.to} via "${item.mention}"`)
+          .join("\n");
+        const shouldApply = confirm(
+          `Er zijn ${workingMentions} werkdocument-mention(s) en ${memoryMentions} memory-mention(s) gevonden.\n\n` +
+            `${examples}${unlinked.totalCount > 5 ? "\n- …" : ""}\n\n` +
+            "Wil je deze mentions nu automatisch verbinden met Markdown-links?",
+        );
+        if (!shouldApply) return;
+        if (isDirty) {
+          status.textContent = "Automatisch linken geannuleerd: sla eerst je open wijzigingen op.";
+          return;
+        }
+        status.textContent = "Onverbonden mentions verbinden…";
+        const result = await linkSecondBrainUnlinkedMentions("all");
+        await loadLists(fileSelect.value || undefined);
+        if (fileSelect.value && fileSelect.value !== EXTERNAL_MARKDOWN_VALUE) {
+          await loadSelection();
+        }
+        if (memoryPanelVisible) await renderMemoryPanel();
+        status.textContent =
+          `Mentions verbonden: ${result.appliedCount} link(s) in ${result.filesChanged} bestand(en). ` +
+          `${result.skippedCount ? `${result.skippedCount} overgeslagen.` : ""}`;
+      }
+    } catch (e) {
+      status.textContent = `Second-brain context ophalen mislukt: ${String((e as Error).message)}`;
+    } finally {
+      setAgentChatRequestBusy(false);
+    }
+  }
+
+  function lastAskAssistantReply(): string {
+    for (let i = agentChatHistory.length - 1; i >= 0; i--) {
+      const turn = agentChatHistory[i];
+      if (turn?.role === "assistant" && turn.mode === "ask" && turn.content.trim()) {
+        return turn.content.trim();
+      }
+    }
+    return "";
+  }
+
+  function prepareLastAskReplyForAgent(): void {
+    const reply = lastAskAssistantReply();
+    if (!reply) {
+      status.textContent = "Geen eerder Ask-antwoord gevonden om als Agent-instructie te gebruiken.";
+      return;
+    }
+    agentChatMode = "agent";
+    refreshAgentChatModeUi();
+    const targetHint = fileSelect.value && fileSelect.value !== EXTERNAL_MARKDOWN_VALUE ? ` in \`${fileSelect.value}\`` : "";
+    agentChatInput.value =
+      `Gebruik het laatste Ask-resultaat hieronder als definitieve inhoud en verwerk dit reviewbaar${targetHint}.\n\n` +
+      `Plaats of vervang alleen de relevante sectie. Maak exacte find/replace-patches en behoud de rest van het document.\n\n` +
+      `Laatste Ask-resultaat:\n\n${reply}`;
+    agentChatInput.focus();
+    agentChatInput.setSelectionRange(agentChatInput.value.length, agentChatInput.value.length);
+    status.textContent = "Laatste Ask-antwoord staat klaar als Agent-instructie.";
+    syncAgentChatDisabled();
+  }
+
   function agentMarkdownReferenceVariants(): Array<{ needle: string; path: string }> {
     const out: Array<{ needle: string; path: string }> = [];
     const seen = new Set<string>();
@@ -3147,26 +3952,70 @@ export async function bootstrap() {
     return out.sort((a, b) => b.needle.length - a.needle.length);
   }
 
-  function resolveAgentMarkdownReference(raw: string): string | null {
+  function normalizeMarkdownReferenceCandidate(raw: string): string {
     let s = String(raw || "").trim();
-    if (!s) return null;
+    if (!s) return "";
     try {
       s = decodeURIComponent(s);
     } catch {
       /* Houd originele tekst als decodeURIComponent faalt. */
     }
-    s = s
+    if (s.startsWith("<") && s.includes(">")) {
+      s = s.slice(1, s.indexOf(">"));
+    }
+    return s
       .replace(/^['"`(<\[]+|['"`),.>\]]+$/g, "")
+      .replace(/\\([()\\])/g, "$1")
       .replace(/\\/g, "/")
       .replace(/^\.?\//, "")
-      .replace(/^Files\//i, "");
+      .replace(/^Files\//i, "")
+      .trim();
+  }
+
+  function withMarkdownExtension(candidate: string): string {
+    return /\.(?:md|markdown)$/i.test(candidate) ? candidate.replace(/\.markdown$/i, ".md") : `${candidate}.md`;
+  }
+
+  function normalizeRelativeMarkdownPath(candidate: string): string {
+    const parts: string[] = [];
+    for (const part of candidate.replace(/\\/g, "/").split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        parts.pop();
+      } else {
+        parts.push(part);
+      }
+    }
+    return parts.join("/");
+  }
+
+  function relativeMarkdownCandidate(candidate: string, baseRelPath?: string): string {
+    const normalized = candidate.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!baseRelPath || normalized.startsWith("/")) return normalizeRelativeMarkdownPath(normalized);
+    const folder = folderOfMarkdownPath(baseRelPath);
+    return normalizeRelativeMarkdownPath(folder ? `${folder}/${normalized}` : normalized);
+  }
+
+  function resolveAgentMarkdownReference(raw: string, baseRelPath?: string): string | null {
+    let s = normalizeMarkdownReferenceCandidate(raw);
+    if (!s || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(s)) return null;
     const hash = s.indexOf("#");
     if (hash >= 0) s = s.slice(0, hash);
     const query = s.indexOf("?");
     if (query >= 0) s = s.slice(0, query);
-    const exact = corpusMarkdownPaths.find((p) => p.toLowerCase() === s.toLowerCase());
-    if (exact) return exact;
-    const basenameMatches = corpusMarkdownPaths.filter((p) => baseNameMd(p).toLowerCase() === s.toLowerCase());
+    s = s.trim();
+    const candidates = [s, withMarkdownExtension(s)];
+    if (baseRelPath) {
+      candidates.push(relativeMarkdownCandidate(s, baseRelPath), relativeMarkdownCandidate(withMarkdownExtension(s), baseRelPath));
+    }
+    for (const candidate of candidates) {
+      const normalized = candidate.replace(/\.markdown$/i, ".md");
+      const exact = corpusMarkdownPaths.find((p) => p.toLowerCase() === normalized.toLowerCase());
+      if (exact) return exact;
+    }
+    const basenameMatches = corpusMarkdownPaths.filter((p) =>
+      candidates.some((candidate) => baseNameMd(p).toLowerCase() === candidate.replace(/\.markdown$/i, ".md").toLowerCase()),
+    );
     return basenameMatches.length === 1 ? basenameMatches[0] : null;
   }
 
@@ -3180,7 +4029,30 @@ export async function bootstrap() {
       selectedFolder = folderOfMarkdownPath(path);
       await loadSelection();
     }
-    status.textContent = `Geopend via agent-link: ${path}`;
+    status.textContent = `Geopend via Markdown-link: ${path}`;
+  }
+
+  function attachLocalMarkdownLinkHandler(root: HTMLElement, opts: { editable?: boolean } = {}): void {
+    root.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement | null;
+      if (!opts.editable && target?.closest('[contenteditable="true"]')) return;
+      const a = target?.closest<HTMLAnchorElement>("a[href]");
+      if (!a || !root.contains(a)) return;
+      const rawHref = a.getAttribute("href") || "";
+      const currentPath = fileSelect.value && fileSelect.value !== EXTERNAL_MARKDOWN_VALUE ? fileSelect.value : undefined;
+      const path = resolveAgentMarkdownReference(rawHref, currentPath) ?? resolveAgentMarkdownReference(a.textContent || "", currentPath);
+      if (!path) return;
+
+      if (opts.editable && !(e.ctrlKey || e.metaKey)) {
+        a.title = "Ctrl/Cmd+klik om dit Markdown-document te openen.";
+        status.textContent = "Gebruik Ctrl/Cmd+klik om lokale Markdown-links in de editor te openen.";
+        return;
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      void openMarkdownReferenceInViewer(path);
+    });
   }
 
   function linkifyAgentMarkdownReferences(root: HTMLElement): void {
@@ -3802,7 +4674,7 @@ export async function bootstrap() {
         {
           mode,
           message: text,
-          markdown: askCorpus ? "" : md,
+          markdown: md,
           chatId: activeAgentChatId,
           chatTitle: activeSessionForActivity?.title || "",
           name: docName ?? "",
@@ -3824,6 +4696,9 @@ export async function bootstrap() {
         for (const row of res.activities) {
           if (row && row.type === "activity") pushCorpusActivityRow(row);
         }
+      }
+      if (askTools && res.performanceMetrics) {
+        pushPerformanceMetricsRow(res.performanceMetrics);
       }
       assistantText = res.reply;
       pendingMemoryActions = [];
@@ -3849,12 +4724,12 @@ export async function bootstrap() {
         let agentExternalDiskWriteFailed = false;
         if (isExternal) {
           try {
-            await writeExternalMarkdownDisk(res.markdown);
+            await writeExternalMarkdown(res.markdown);
             await loadDocumentData(EXTERNAL_MARKDOWN_VALUE, tplSelect.value);
           } catch (e) {
             agentExternalDiskWriteFailed = true;
             await syncExternalReviewsAndTemplate(tplSelect.value);
-            status.textContent = `Chat-agent: inhoud in de viewer is bijgewerkt; opslaan op schijf mislukt (${String((e as Error).message)}). Controleer rood/groen en keur akkoord of niet akkoord; probeer daarna Ctrl+S voor schijf.`;
+            status.textContent = `Chat-agent: inhoud in de viewer is bijgewerkt; opslaan naar ${externalDocumentSourceLabel()} mislukt (${String((e as Error).message)}). Controleer rood/groen en keur akkoord of niet akkoord; probeer daarna Ctrl+S.`;
           }
         } else if (res.wroteFile) {
           await loadDocumentData(name, tplSelect.value);
@@ -3935,8 +4810,33 @@ export async function bootstrap() {
     void renderMemoryPanel();
   });
   agentCorpusRefreshBtn.addEventListener("click", () => void refreshCorpusInformation());
+  agentSecondBrainBtn.addEventListener("click", () => void showSecondBrainContextSummary());
+  agentAskToAgentBtn.addEventListener("click", () => prepareLastAskReplyForAgent());
+  promptMacroBtn.addEventListener("click", () => void showPromptMacroDialog());
+  meetingReportBtn.addEventListener("click", () => showMeetingReportDialog());
   agentChatClearBtn.addEventListener("click", () => clearAgentChat());
   agentChatSendBtn.addEventListener("click", () => void submitAgentChat());
+  promptMacroSelect.addEventListener("change", () => fillPromptMacroForm(selectedPromptMacro()));
+  promptMacroNewBtn.addEventListener("click", () => {
+    promptMacroSelect.value = "";
+    fillPromptMacroForm(null);
+    promptMacroName.focus();
+  });
+  promptMacroDeleteBtn.addEventListener("click", () => void deleteSelectedPromptMacro());
+  promptMacroSaveBtn.addEventListener("click", () => void savePromptMacroFromForm());
+  promptMacroRunBtn.addEventListener("click", () => void runSelectedPromptMacro());
+  promptMacroCloseBtn.addEventListener("click", () => hidePromptMacroDialog());
+  promptMacroDialog.addEventListener("mousedown", (e) => {
+    if (e.target === promptMacroDialog) hidePromptMacroDialog();
+  });
+  meetingReportCancelBtn.addEventListener("click", () => hideMeetingReportDialog());
+  meetingReportSubmitBtn.addEventListener("click", () => void submitMeetingReportTranscript());
+  meetingReportTranscript.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      void submitMeetingReportTranscript();
+    }
+  });
   agentChatInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -4031,6 +4931,11 @@ export async function bootstrap() {
   }
 
   async function toggleEditorSurfaceMode(): Promise<void> {
+    if (externalDocumentKind === "confluence") {
+      status.textContent = "Markdown-bronmodus is uitgeschakeld voor Confluence-pagina's met vergrendelde macro's.";
+      refreshEditorSourceToggleUi();
+      return;
+    }
     if (editorSurfaceMode === "visual") await switchEditorToCodeMode();
     else await switchEditorToVisualMode();
   }
@@ -4244,6 +5149,7 @@ export async function bootstrap() {
     host.addEventListener("keydown", onKeydown);
     codeTa.addEventListener("input", onInput);
     codeTa.addEventListener("keydown", onCodeKeydown);
+    attachLocalMarkdownLinkHandler(host, { editable: true });
     host.addEventListener("click", (e) => {
       const t = (e.target as HTMLElement).closest(`.${REVIEW_HIGHLIGHT_CLASS}`);
       if (!t || !host.contains(t)) return;
@@ -4478,6 +5384,33 @@ export async function bootstrap() {
     }
   }
 
+  async function deleteMarkdownFromTree(filePath: string): Promise<void> {
+    if (!filePath) return;
+    if (fileSelect.value === filePath && isDirty) {
+      const okDirty = confirm(`"${filePath}" heeft mogelijk niet-opgeslagen wijzigingen. Toch verwijderen?`);
+      if (!okDirty) return;
+    }
+    const ok = confirm(
+      `Verwijder "${filePath}"?\n\n` +
+        "Dit verwijdert ook bijbehorende review-opmerkingen en de laatste backup voor dit bestand.",
+    );
+    if (!ok) return;
+    try {
+      await deleteMarkdownFile(filePath);
+      const wasSelected = fileSelect.value === filePath;
+      if (wasSelected) {
+        fileSelect.value = "";
+        reviewComments = [];
+        currentMd = "";
+        isDirty = false;
+      }
+      status.textContent = `${filePath} verwijderd.`;
+      await loadLists(undefined);
+    } catch (e) {
+      status.textContent = `Verwijderen mislukt: ${String((e as Error).message)}`;
+    }
+  }
+
   function attachMarkdownTreeDropTarget(el: HTMLElement, destFolderFullPath: string): void {
     el.addEventListener("dragenter", (e) => {
       if (!treeDragMarkdownPath) return;
@@ -4624,33 +5557,60 @@ export async function bootstrap() {
 
     for (const filePath of node.files) {
       const base = filePath.includes("/") ? filePath.slice(filePath.lastIndexOf("/") + 1) : filePath;
-      const btn = el("button", "mv-file-tree-row mv-file-tree-row--file");
-      btn.type = "button";
-      btn.draggable = true;
-      btn.textContent = base;
-      btn.title = `${filePath} — slepen om naar een andere map te verplaatsen`;
-      btn.style.paddingLeft = `${22 + depth * 14}px`;
-      if (filePath === sel) btn.classList.add("is-selected");
-      btn.addEventListener("dragstart", (e) => {
+      const row = el("div", "mv-file-tree-row mv-file-tree-row--file");
+      row.draggable = true;
+      row.title = `${filePath} — slepen om naar een andere map te verplaatsen`;
+      row.style.paddingLeft = `${22 + depth * 14}px`;
+      if (filePath === sel) row.classList.add("is-selected");
+
+      const openBtn = el("button", "mv-file-tree-file-name", base);
+      openBtn.type = "button";
+      openBtn.title = filePath;
+      openBtn.addEventListener("click", () => {
+        if (fileSelect.value === filePath) {
+          closeMobileOverlays();
+          return;
+        }
+        fileSelect.value = filePath;
+        selectedFolder = folderOfMarkdownPath(filePath);
+        void loadSelection();
+        closeMobileOverlays();
+      });
+
+      const actions = el("span", "mv-file-tree-file-actions");
+      const renameBtn = el("button", "mv-file-tree-file-action", "✎");
+      renameBtn.type = "button";
+      renameBtn.title = `${filePath} hernoemen`;
+      renameBtn.setAttribute("aria-label", `${filePath} hernoemen`);
+      renameBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showRenameMarkdownDialog(filePath);
+      });
+      const deleteBtn = el("button", "mv-file-tree-file-action mv-file-tree-file-action--danger", "🗑");
+      deleteBtn.type = "button";
+      deleteBtn.title = `${filePath} verwijderen`;
+      deleteBtn.setAttribute("aria-label", `${filePath} verwijderen`);
+      deleteBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void deleteMarkdownFromTree(filePath);
+      });
+      actions.append(renameBtn, deleteBtn);
+      row.append(openBtn, actions);
+
+      row.addEventListener("dragstart", (e) => {
         const dt = e.dataTransfer;
         if (!dt) return;
         treeDragMarkdownPath = filePath;
         dt.setData("text/plain", filePath);
         dt.effectAllowed = "move";
-        btn.classList.add("mv-file-tree-row--dragging");
+        row.classList.add("mv-file-tree-row--dragging");
       });
-      btn.addEventListener("dragend", () => {
+      row.addEventListener("dragend", () => {
         treeDragMarkdownPath = null;
-        btn.classList.remove("mv-file-tree-row--dragging");
+        row.classList.remove("mv-file-tree-row--dragging");
         clearTreeDropHighlights();
       });
-      btn.addEventListener("click", () => {
-        if (fileSelect.value === filePath) return;
-        fileSelect.value = filePath;
-        selectedFolder = folderOfMarkdownPath(filePath);
-        void loadSelection();
-      });
-      container.append(btn);
+      container.append(row);
     }
   }
 
@@ -4697,7 +5657,7 @@ export async function bootstrap() {
 
   async function loadLists(preferredMd?: string) {
     const externalWasSelected = fileSelect.value === EXTERNAL_MARKDOWN_VALUE;
-    const keepExternal = externalFileHandle !== null;
+    const keepExternal = externalDocumentKind !== "none";
 
     const [{ files: mdFiles, folders: mdFolders }, templates] = await Promise.all([
       fetchMarkdownIndex(),
@@ -4714,7 +5674,10 @@ export async function bootstrap() {
     if (keepExternal) {
       const o = document.createElement("option");
       o.value = EXTERNAL_MARKDOWN_VALUE;
-      o.textContent = `📄 ${externalFileLabel} (extern op schijf)`;
+      o.textContent =
+        externalDocumentKind === "confluence"
+          ? `☁ ${externalFileLabel} (Confluence v${externalConfluencePage?.version || "?"})`
+          : `📄 ${externalFileLabel} (extern op schijf)`;
       fileSelect.insertBefore(o, fileSelect.firstChild);
     }
     for (const t of templates) {
@@ -4772,13 +5735,15 @@ export async function bootstrap() {
 
   async function loadDocumentData(name: string, tplName: string): Promise<void> {
     if (name === EXTERNAL_MARKDOWN_VALUE) {
-      if (!externalFileHandle) {
+      if (externalDocumentKind === "none") {
         status.textContent = "Extern document: geen bestandskoppeling meer.";
         currentMd = "";
         reviewComments = [];
         rerenderAgentChatMessages();
       } else {
-        currentMd = await readExternalMarkdownDisk();
+        if (externalDocumentKind === "disk") {
+          currentMd = await readExternalMarkdownDisk();
+        }
         try {
           applyReviewPack(await fetchReviewComments(getOrCreateExternalAgentVirtualName()));
         } catch {
@@ -4790,14 +5755,14 @@ export async function bootstrap() {
         try {
           if (!tplName || !templatesAvailable) {
             currentMerged = {};
-            status.textContent = `${externalFileLabel} (extern) — ${reviewNote}`;
+            status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — ${reviewNote}`;
           } else {
             const raw = await fetchTemplate(tplName);
             currentMerged = asTemplate(raw);
-            status.textContent = `${externalFileLabel} (extern) — ${tplName}; ${reviewNote}`;
+            status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — ${tplName}; ${reviewNote}`;
           }
         } catch {
-          status.textContent = `${externalFileLabel} (extern) — template niet gelezen (${tplName}), defaults. ${reviewNote}`;
+          status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — template niet gelezen (${tplName}), defaults. ${reviewNote}`;
           currentMerged = {};
         }
       }
@@ -4827,7 +5792,7 @@ export async function bootstrap() {
 
   /** Extern: reviews + template/status verversen zonder `currentMd` van schijf te overschrijven. */
   async function syncExternalReviewsAndTemplate(tplName: string): Promise<void> {
-    if (!externalFileHandle) return;
+    if (externalDocumentKind === "none") return;
     try {
       applyReviewPack(await fetchReviewComments(getOrCreateExternalAgentVirtualName()));
     } catch {
@@ -4839,14 +5804,14 @@ export async function bootstrap() {
     try {
       if (!tplName || !templatesAvailable) {
         currentMerged = {};
-        status.textContent = `${externalFileLabel} (extern) — ${reviewNote}`;
+        status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — ${reviewNote}`;
       } else {
         const raw = await fetchTemplate(tplName);
         currentMerged = asTemplate(raw);
-        status.textContent = `${externalFileLabel} (extern) — ${tplName}; ${reviewNote}`;
+        status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — ${tplName}; ${reviewNote}`;
       }
     } catch {
-      status.textContent = `${externalFileLabel} (extern) — template niet gelezen (${tplName}), defaults. ${reviewNote}`;
+      status.textContent = `${externalFileLabel} (${externalDocumentSourceLabel()}) — template niet gelezen (${tplName}), defaults. ${reviewNote}`;
       currentMerged = {};
     }
   }
@@ -4871,7 +5836,7 @@ export async function bootstrap() {
         syncToolbarDocTitle();
         return;
       }
-      if (name === EXTERNAL_MARKDOWN_VALUE && !externalFileHandle) {
+      if (name === EXTERNAL_MARKDOWN_VALUE && externalDocumentKind === "none") {
         teardownEditor();
         status.textContent =
           "Extern document niet meer gekoppeld — kies opnieuw via Openen… of selecteer een bestand uit Files/.";
@@ -4927,7 +5892,7 @@ export async function bootstrap() {
         if (typeof result.markdown === "string") {
           currentMd = result.markdown;
           try {
-            await writeExternalMarkdownDisk(result.markdown);
+            await writeExternalMarkdown(result.markdown);
           } catch (e) {
             status.textContent = `Agent klaar maar schijf niet bijgewerkt: ${String((e as Error).message)}`;
           }
@@ -4988,8 +5953,10 @@ export async function bootstrap() {
     }
     const handle = handles[0];
     if (!handle) return;
+    externalDocumentKind = "disk";
     externalFileHandle = handle;
     externalFileLabel = handle.name;
+    externalConfluencePage = null;
     let opt = Array.from(fileSelect.options).find((o) => o.value === EXTERNAL_MARKDOWN_VALUE);
     if (!opt) {
       opt = document.createElement("option");
@@ -5002,7 +5969,159 @@ export async function bootstrap() {
     await loadSelection();
   }
 
-  fileSelect.addEventListener("change", () => {
+  function showConfluenceImportDialog(): void {
+    confluenceImportInput.value = "";
+    confluenceImportDialog.hidden = false;
+    confluenceImportInput.focus();
+  }
+
+  function hideConfluenceImportDialog(): void {
+    confluenceImportDialog.hidden = true;
+  }
+
+  async function openConfluencePageInEditor(input: { pageId?: string; url?: string }): Promise<void> {
+    if (!(await confirmLeaveEditModeForImport())) return;
+    status.textContent = "Confluence-pagina ophalen…";
+    const page = await fetchConfluencePage(input);
+    externalDocumentKind = "confluence";
+    externalFileHandle = null;
+    externalConfluencePage = {
+      id: page.id,
+      title: page.title || `Confluence ${page.id}`,
+      version: page.version.number || 1,
+      url: page.url,
+    };
+    externalFileLabel = externalConfluencePage.title;
+    currentMd = page.markdown || page.text || "";
+    reviewComments = [];
+    rerenderAgentChatMessages();
+    let opt = Array.from(fileSelect.options).find((o) => o.value === EXTERNAL_MARKDOWN_VALUE);
+    if (!opt) {
+      opt = document.createElement("option");
+      opt.value = EXTERNAL_MARKDOWN_VALUE;
+      fileSelect.insertBefore(opt, fileSelect.firstChild);
+    }
+    opt.textContent = `☁ ${externalFileLabel} (Confluence v${externalConfluencePage.version})`;
+    fileSelect.value = EXTERNAL_MARKDOWN_VALUE;
+    selectedFolder = "";
+    hideConfluenceImportDialog();
+    hideConfluenceSearchDialog();
+    clearAgentChat();
+    await loadSelection();
+    status.textContent = `${externalFileLabel} — geïmporteerd uit Confluence v${externalConfluencePage.version}. Autosave staat uit; gebruik handmatig opslaan om terug te schrijven.`;
+  }
+
+  async function importConfluencePageToEditor(): Promise<void> {
+    const raw = confluenceImportInput.value.trim();
+    if (!raw) {
+      status.textContent = "Plak eerst een Confluence URL of pageId.";
+      confluenceImportInput.focus();
+      return;
+    }
+    confluenceImportRunBtn.disabled = true;
+    try {
+      const isPageId = /^\d+$/.test(raw);
+      await openConfluencePageInEditor(isPageId ? { pageId: raw } : { url: raw });
+    } catch (e) {
+      status.textContent = `Confluence importeren mislukt: ${String((e as Error).message)}`;
+    } finally {
+      confluenceImportRunBtn.disabled = false;
+    }
+  }
+
+  function showConfluenceSearchDialog(): void {
+    confluenceSearchResults.replaceChildren(el("div", "mv-md-dialog-hint", "Vul een zoekterm in en klik op Zoeken."));
+    confluenceSearchDialog.hidden = false;
+    confluenceSearchQueryInput.focus();
+  }
+
+  function hideConfluenceSearchDialog(): void {
+    confluenceSearchDialog.hidden = true;
+  }
+
+  function renderConfluenceSearchResults(results: ConfluenceSearchResult[]): void {
+    confluenceSearchResults.replaceChildren();
+    if (!results.length) {
+      confluenceSearchResults.append(el("div", "mv-md-dialog-hint", "Geen Confluence-pagina's gevonden."));
+      return;
+    }
+    for (const result of results) {
+      const item = el("article", "mv-confluence-search-result");
+      const body = el("div", "mv-confluence-search-result-body");
+      body.append(
+        el("div", "mv-confluence-search-result-title", result.title || `Confluence ${result.id}`),
+        el(
+          "div",
+          "mv-confluence-search-result-meta",
+          `${result.space.key || "?"}${result.version.number ? ` · v${result.version.number}` : ""}${
+            result.version.when ? ` · ${new Date(result.version.when).toLocaleDateString("nl-NL")}` : ""
+          }`,
+        ),
+      );
+      const actions = el("div", "mv-confluence-search-result-actions");
+      if (result.url) {
+        const open = document.createElement("a");
+        open.className = "mv-ribbon-btn mv-ribbon-btn--ghost";
+        open.href = result.url;
+        open.target = "_blank";
+        open.rel = "noreferrer";
+        open.textContent = "Open";
+        actions.append(open);
+      }
+      const importBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Importeer");
+      importBtn.type = "button";
+      importBtn.addEventListener("click", async () => {
+        importBtn.disabled = true;
+        try {
+          await openConfluencePageInEditor({ pageId: result.id });
+        } catch (e) {
+          status.textContent = `Confluence importeren mislukt: ${String((e as Error).message)}`;
+        } finally {
+          importBtn.disabled = false;
+        }
+      });
+      actions.append(importBtn);
+      item.append(body, actions);
+      confluenceSearchResults.append(item);
+    }
+  }
+
+  async function runConfluenceSearch(): Promise<void> {
+    const query = confluenceSearchQueryInput.value.trim();
+    if (!query) {
+      status.textContent = "Vul eerst een Confluence zoekterm in.";
+      confluenceSearchQueryInput.focus();
+      return;
+    }
+    confluenceSearchRunBtn.disabled = true;
+    confluenceSearchResults.replaceChildren(el("div", "mv-md-dialog-hint", "Confluence doorzoeken…"));
+    status.textContent = "Confluence doorzoeken…";
+    try {
+      const payload = await searchConfluencePages({
+        query,
+        spaceKey: confluenceSearchSpaceInput.value.trim() || undefined,
+        limit: Number(confluenceSearchLimitInput.value || 10),
+      });
+      renderConfluenceSearchResults(payload.results);
+      status.textContent = `Confluence zoeken klaar: ${payload.results.length} resultaat/resultaten.`;
+    } catch (e) {
+      confluenceSearchResults.replaceChildren(
+        el("div", "mv-md-dialog-hint", `Confluence zoeken mislukt: ${String((e as Error).message)}`),
+      );
+      status.textContent = `Confluence zoeken mislukt: ${String((e as Error).message)}`;
+    } finally {
+      confluenceSearchRunBtn.disabled = false;
+    }
+  }
+
+  fileSelect.addEventListener("change", async () => {
+    try {
+      await saveCurrentEditorToBoundDoc();
+    } catch (e) {
+      status.textContent = `Documentwissel geannuleerd: opslaan mislukt (${String((e as Error).message)}).`;
+      if (editorBoundDoc) fileSelect.value = editorBoundDoc;
+      return;
+    }
     if (fileSelect.value !== EXTERNAL_MARKDOWN_VALUE) {
       clearExternalMarkdownSession();
       Array.from(fileSelect.options)
@@ -5011,7 +6130,7 @@ export async function bootstrap() {
     }
     clearAgentChat();
     selectedFolder = folderOfMarkdownPath(fileSelect.value);
-    void loadSelection();
+    await loadSelection();
   });
   tplSelect.addEventListener("change", () => {
     try {
@@ -5022,8 +6141,52 @@ export async function bootstrap() {
     void loadSelection();
   });
   browseFilesBtn.addEventListener("click", () => void openMarkdownFromDiskWithPicker());
+  mobileFileTreeBtn.addEventListener("click", () => openMobileFileTree());
+  mobileMenuBtn.addEventListener("click", () => openMobileMenu());
+  mobileChatBtn.addEventListener("click", () => toggleMobileChat());
+  mobileChatLauncher.addEventListener("click", () => toggleMobileChat());
+  mobileBackdrop.addEventListener("click", () => closeMobileOverlays());
+  mobileMenuCloseBtn.addEventListener("click", () => closeMobileOverlays());
+  fileTreeCloseBtn.addEventListener("click", () => closeMobileOverlays());
+  agentChatCloseBtn.addEventListener("click", () => closeMobileOverlays());
+  mobileLayoutMq.addEventListener("change", () => {
+    if (!mobileLayoutMq.matches) closeMobileOverlays();
+    else syncMobileOverlayState();
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeMobileOverlays();
+  });
+  confluenceImportBtn.addEventListener("click", () => showConfluenceImportDialog());
+  confluenceSearchBtn.addEventListener("click", () => showConfluenceSearchDialog());
+  confluenceImportCancelBtn.addEventListener("click", () => hideConfluenceImportDialog());
+  confluenceImportRunBtn.addEventListener("click", () => void importConfluencePageToEditor());
+  confluenceImportDialog.addEventListener("mousedown", (e) => {
+    if (e.target === confluenceImportDialog) hideConfluenceImportDialog();
+  });
+  confluenceImportInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void importConfluencePageToEditor();
+    }
+  });
+  confluenceSearchCancelBtn.addEventListener("click", () => hideConfluenceSearchDialog());
+  confluenceSearchRunBtn.addEventListener("click", () => void runConfluenceSearch());
+  confluenceSearchDialog.addEventListener("mousedown", (e) => {
+    if (e.target === confluenceSearchDialog) hideConfluenceSearchDialog();
+  });
+  confluenceSearchQueryInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void runConfluenceSearch();
+    }
+  });
+  confluenceSearchSpaceInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void runConfluenceSearch();
+    }
+  });
   pasteMdBtn.addEventListener("click", () => showMarkdownStringDialog());
-  renameMdBtn.addEventListener("click", () => showRenameMarkdownDialog());
   renameCancelBtn.addEventListener("click", () => hideRenameMarkdownDialog());
   renameDialog.addEventListener("mousedown", (e) => {
     if (e.target === renameDialog) hideRenameMarkdownDialog();

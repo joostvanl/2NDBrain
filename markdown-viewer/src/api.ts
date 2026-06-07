@@ -46,8 +46,130 @@ export type CorpusIndexRebuildPayload = {
   memoryGeneratedAt: string;
 };
 
+export type SecondBrainRelationEntry = {
+  path: string;
+  title: string;
+  linkCount: number;
+  backlinkCount: number;
+  unlinkedMentionCount: number;
+  relatedCount: number;
+};
+
+export type SecondBrainSummary = {
+  scope: "working" | "memory" | string;
+  generatedAt: string;
+  entryCount: number;
+  metadataKeys: string[];
+  tagCounts: Record<string, number>;
+  relationEntries: SecondBrainRelationEntry[];
+  staleCandidates: { path: string; title: string; status?: string }[];
+  unlinkedMentions: { from: string; to: string; title: string; mention: string }[];
+};
+
+export type SecondBrainContextPayload = {
+  generatedAt: string;
+  working: SecondBrainSummary;
+  memory: SecondBrainSummary;
+};
+
+export type SecondBrainUnlinkedMention = {
+  id: string;
+  scope: "working" | "memory" | string;
+  from: string;
+  to: string;
+  title: string;
+  mention: string;
+};
+
+export type SecondBrainUnlinkedMentionsPayload = {
+  generatedAt: string;
+  working: SecondBrainUnlinkedMention[];
+  memory: SecondBrainUnlinkedMention[];
+  totalCount: number;
+};
+
+export type SecondBrainLinkMentionsPayload = {
+  ok: boolean;
+  scope: "all" | "working" | "memory" | string;
+  filesChanged: number;
+  appliedCount: number;
+  skippedCount: number;
+  entryCount?: number;
+  memoryEntryCount?: number;
+};
+
 export type AgentTranscriptCleanupPayload = {
   text: string;
+};
+
+export type ConfluenceConfigPayload = {
+  ok: boolean;
+  configured: boolean;
+  baseUrl: string;
+  hasPat: boolean;
+};
+
+export type ConfluencePagePayload = {
+  ok: boolean;
+  id: string;
+  type: string;
+  status: string;
+  title: string;
+  space: { key: string; name: string };
+  version: { number: number | null; when: string; by: string };
+  ancestors: { id: string; title: string }[];
+  url: string;
+  storageHtml: string;
+  text: string;
+  markdown: string;
+  truncated: boolean;
+};
+
+export type ConfluencePageSavePayload = {
+  ok: boolean;
+  id: string;
+  title: string;
+  version: number;
+  url: string;
+};
+
+export type ConfluenceSearchResult = {
+  id: string;
+  type: string;
+  status: string;
+  title: string;
+  space: { key: string; name: string };
+  version: { number: number | null; when: string; by: string };
+  url: string;
+};
+
+export type ConfluenceSearchPayload = {
+  ok: boolean;
+  query: string;
+  spaceKey: string;
+  limit: number;
+  size: number;
+  results: ConfluenceSearchResult[];
+};
+
+export type PromptMacro = {
+  id: string;
+  name: string;
+  description: string;
+  mode: AgentChatMode;
+  prompt: string;
+  requiresContent: boolean;
+  contentLabel: string;
+  contentPlaceholder: string;
+  contentPrefix: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PromptMacrosPayload = {
+  ok: boolean;
+  version: number;
+  macros: PromptMacro[];
 };
 
 export type AgentActivityLogEntry = {
@@ -70,6 +192,7 @@ export type AgentActivityLogEntry = {
   webSearch: boolean;
   memoryActionCount: number;
   corpusCreatedPaths: string[];
+  performanceMetrics?: AgentPerformanceMetrics;
   error: string;
 };
 
@@ -171,6 +294,131 @@ export async function fetchAgentModels(config?: Partial<AgentConfigInput>): Prom
       ? data.models.filter((m): m is string => typeof m === "string" && !!m.trim())
       : [],
   };
+}
+
+export async function fetchConfluenceConfig(): Promise<ConfluenceConfigPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/confluence/config"));
+  if (!r.ok) throw await jsonError(r, `confluence config ${r.status}`);
+  const data = (await r.json()) as Partial<ConfluenceConfigPayload>;
+  return {
+    ok: data.ok !== false,
+    configured: data.configured === true,
+    baseUrl: typeof data.baseUrl === "string" ? data.baseUrl : "",
+    hasPat: data.hasPat === true,
+  };
+}
+
+export async function fetchConfluencePage(input: { pageId?: string; url?: string }): Promise<ConfluencePagePayload> {
+  const r = await fetch(agentApiFetchUrl("/api/confluence/page"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw await jsonError(r, `confluence page ${r.status}`);
+  return (await r.json()) as ConfluencePagePayload;
+}
+
+export async function searchConfluencePages(input: {
+  query: string;
+  spaceKey?: string;
+  limit?: number;
+}): Promise<ConfluenceSearchPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/confluence/search"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw await jsonError(r, `confluence search ${r.status}`);
+  const data = (await r.json()) as Partial<ConfluenceSearchPayload>;
+  return {
+    ok: data.ok !== false,
+    query: typeof data.query === "string" ? data.query : input.query,
+    spaceKey: typeof data.spaceKey === "string" ? data.spaceKey : input.spaceKey || "",
+    limit: typeof data.limit === "number" ? data.limit : input.limit || 10,
+    size: typeof data.size === "number" ? data.size : 0,
+    results: Array.isArray(data.results) ? data.results : [],
+  };
+}
+
+export async function saveConfluencePage(input: {
+  pageId: string;
+  title: string;
+  baseVersion: number;
+  markdown: string;
+}): Promise<ConfluencePageSavePayload> {
+  const r = await fetch(agentApiFetchUrl("/api/confluence/page"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw await jsonError(r, `save confluence page ${r.status}`);
+  return (await r.json()) as ConfluencePageSavePayload;
+}
+
+function normalizePromptMacro(raw: unknown): PromptMacro | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const id = typeof o.id === "string" ? o.id.trim() : "";
+  const name = typeof o.name === "string" ? o.name.trim() : "";
+  const prompt = typeof o.prompt === "string" ? o.prompt : "";
+  if (!id || !name || !prompt.trim()) return null;
+  return {
+    id,
+    name,
+    description: typeof o.description === "string" ? o.description : "",
+    mode: o.mode === "ask" ? "ask" : "agent",
+    prompt,
+    requiresContent: o.requiresContent === true,
+    contentLabel: typeof o.contentLabel === "string" && o.contentLabel.trim() ? o.contentLabel : "Aanvullende inhoud",
+    contentPlaceholder: typeof o.contentPlaceholder === "string" ? o.contentPlaceholder : "",
+    contentPrefix: typeof o.contentPrefix === "string" && o.contentPrefix.trim() ? o.contentPrefix : "Aanvullende inhoud:",
+    createdAt: typeof o.createdAt === "string" ? o.createdAt : "",
+    updatedAt: typeof o.updatedAt === "string" ? o.updatedAt : "",
+  };
+}
+
+function normalizePromptMacrosPayload(raw: unknown): PromptMacrosPayload {
+  const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const macros = Array.isArray(o.macros) ? o.macros.map(normalizePromptMacro).filter((m): m is PromptMacro => !!m) : [];
+  return {
+    ok: o.ok !== false,
+    version: typeof o.version === "number" ? o.version : 1,
+    macros,
+  };
+}
+
+export async function fetchPromptMacros(): Promise<PromptMacrosPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/prompt-macros"));
+  if (!r.ok) throw await jsonError(r, `prompt macros ${r.status}`);
+  return normalizePromptMacrosPayload(await r.json());
+}
+
+export async function createPromptMacro(input: Partial<PromptMacro>): Promise<PromptMacrosPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/prompt-macros"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw await jsonError(r, `create prompt macro ${r.status}`);
+  return normalizePromptMacrosPayload(await r.json());
+}
+
+export async function updatePromptMacro(id: string, input: Partial<PromptMacro>): Promise<PromptMacrosPayload> {
+  const r = await fetch(agentApiFetchUrl(`/api/prompt-macros/${encodeURIComponent(id)}`), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!r.ok) throw await jsonError(r, `update prompt macro ${r.status}`);
+  return normalizePromptMacrosPayload(await r.json());
+}
+
+export async function deletePromptMacro(id: string): Promise<PromptMacrosPayload> {
+  const r = await fetch(agentApiFetchUrl(`/api/prompt-macros/${encodeURIComponent(id)}`), {
+    method: "DELETE",
+  });
+  if (!r.ok) throw await jsonError(r, `delete prompt macro ${r.status}`);
+  return normalizePromptMacrosPayload(await r.json());
 }
 
 export type AgentInstructionsPayload = {
@@ -429,6 +677,43 @@ export async function rebuildCorpusIndex(): Promise<CorpusIndexRebuildPayload> {
   };
 }
 
+export async function fetchSecondBrainContext(): Promise<SecondBrainContextPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/second-brain/context"));
+  if (!r.ok) throw await jsonError(r, `second-brain context ${r.status}`);
+  return (await r.json()) as SecondBrainContextPayload;
+}
+
+export async function fetchSecondBrainUnlinkedMentions(): Promise<SecondBrainUnlinkedMentionsPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/second-brain/unlinked-mentions"));
+  if (!r.ok) throw await jsonError(r, `second-brain unlinked mentions ${r.status}`);
+  const data = (await r.json()) as Partial<SecondBrainUnlinkedMentionsPayload>;
+  return {
+    generatedAt: typeof data.generatedAt === "string" ? data.generatedAt : "",
+    working: Array.isArray(data.working) ? data.working : [],
+    memory: Array.isArray(data.memory) ? data.memory : [],
+    totalCount: typeof data.totalCount === "number" ? data.totalCount : 0,
+  };
+}
+
+export async function linkSecondBrainUnlinkedMentions(scope: "all" | "working" | "memory" = "all"): Promise<SecondBrainLinkMentionsPayload> {
+  const r = await fetch(agentApiFetchUrl("/api/second-brain/link-mentions"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope }),
+  });
+  if (!r.ok) throw await jsonError(r, `second-brain link mentions ${r.status}`);
+  const data = (await r.json()) as Partial<SecondBrainLinkMentionsPayload>;
+  return {
+    ok: data.ok === true,
+    scope: typeof data.scope === "string" ? data.scope : scope,
+    filesChanged: typeof data.filesChanged === "number" ? data.filesChanged : 0,
+    appliedCount: typeof data.appliedCount === "number" ? data.appliedCount : 0,
+    skippedCount: typeof data.skippedCount === "number" ? data.skippedCount : 0,
+    entryCount: typeof data.entryCount === "number" ? data.entryCount : undefined,
+    memoryEntryCount: typeof data.memoryEntryCount === "number" ? data.memoryEntryCount : undefined,
+  };
+}
+
 export type ReviewCommentsPayload = {
   comments: ReviewComment[];
   agentChatUiHistory: AgentChatTurn[];
@@ -481,6 +766,26 @@ export type AgentChatOptions = {
 /** Server debug-payload bij `debugLlm`; vooral nuttig bij MCP-assistants zonder JSON in `content`. */
 export type AgentChatLlmDebug = Record<string, unknown>;
 
+export type AgentTokenUsage = {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+};
+
+export type AgentPerformanceMetrics = {
+  durationMs?: number;
+  llmMs?: number;
+  llmCallCount?: number;
+  toolCallCount?: number;
+  contextChars?: number;
+  approxContextTokens?: number;
+  retrievedChars?: number;
+  approxRetrievedTokens?: number;
+  replyChars?: number;
+  tokenUsage?: AgentTokenUsage;
+  retrievalMeta?: unknown;
+};
+
 /** Server-normalised hints na corpus-chat: open een .md en/of markeer een fragment in de viewer. */
 export type ViewerAgentAction =
   | { type: "open"; path: string }
@@ -510,6 +815,8 @@ export type AgentChatResponse = {
   activities?: AgentChatActivityRow[];
   /** Alleen corpus Ask met bibliotheek: model kan bronnen laten zien in de viewer. */
   viewerActions?: ViewerAgentAction[];
+  /** Performance- en tokenmetadata voor deze call, indien beschikbaar. */
+  performanceMetrics?: AgentPerformanceMetrics;
   /** Paden van tijdens deze run nieuw aangemaakte .md-bestanden (corpus Ask). */
   corpusCreatedPaths?: string[];
   /** Geheugenacties die direct door de server zijn uitgevoerd. */
@@ -586,6 +893,40 @@ function normalizeMemoryActionsWire(raw: unknown): AgentMemoryAction[] | undefin
   return out.length ? out : undefined;
 }
 
+function numberOrUndefined(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
+
+function normalizeTokenUsageWire(raw: unknown): AgentTokenUsage | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const out: AgentTokenUsage = {
+    promptTokens: numberOrUndefined(o.promptTokens),
+    completionTokens: numberOrUndefined(o.completionTokens),
+    totalTokens: numberOrUndefined(o.totalTokens),
+  };
+  return out.promptTokens || out.completionTokens || out.totalTokens ? out : undefined;
+}
+
+function normalizePerformanceMetricsWire(raw: unknown): AgentPerformanceMetrics | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const out: AgentPerformanceMetrics = {
+    durationMs: numberOrUndefined(o.durationMs),
+    llmMs: numberOrUndefined(o.llmMs),
+    llmCallCount: numberOrUndefined(o.llmCallCount),
+    toolCallCount: numberOrUndefined(o.toolCallCount),
+    contextChars: numberOrUndefined(o.contextChars),
+    approxContextTokens: numberOrUndefined(o.approxContextTokens),
+    retrievedChars: numberOrUndefined(o.retrievedChars),
+    approxRetrievedTokens: numberOrUndefined(o.approxRetrievedTokens),
+    replyChars: numberOrUndefined(o.replyChars),
+    tokenUsage: normalizeTokenUsageWire(o.tokenUsage),
+    retrievalMeta: o.retrievalMeta,
+  };
+  return Object.values(out).some((v) => v !== undefined) ? out : undefined;
+}
+
 export async function agentChat(body: AgentChatRequestBody, options?: AgentChatOptions): Promise<AgentChatResponse> {
   const streamCorpus =
     body.mode === "ask" && (body.corpusWide === true || body.webSearch === true) && body.activityStream !== false;
@@ -619,6 +960,7 @@ export async function agentChat(body: AgentChatRequestBody, options?: AgentChatO
       debugLlm: data.debugLlm && typeof data.debugLlm === "object" ? (data.debugLlm as AgentChatLlmDebug) : undefined,
       activities: Array.isArray(data.activities) ? data.activities : undefined,
       viewerActions: normalizeViewerActionsWire(data.viewerActions),
+      performanceMetrics: normalizePerformanceMetricsWire(data.performanceMetrics),
       corpusCreatedPaths: normalizeCorpusCreatedPaths(data.corpusCreatedPaths),
       executedMemoryActions: normalizeMemoryActionsWire(data.executedMemoryActions),
       pendingMemoryActions: normalizeMemoryActionsWire(data.pendingMemoryActions),
@@ -659,6 +1001,7 @@ export async function agentChat(body: AgentChatRequestBody, options?: AgentChatO
       debugLlm: data.debugLlm && typeof data.debugLlm === "object" ? (data.debugLlm as AgentChatLlmDebug) : undefined,
       activities: Array.isArray(data.activities) ? data.activities : undefined,
       viewerActions: normalizeViewerActionsWire(data.viewerActions),
+      performanceMetrics: normalizePerformanceMetricsWire(data.performanceMetrics),
       corpusCreatedPaths: normalizeCorpusCreatedPaths(data.corpusCreatedPaths),
       executedMemoryActions: normalizeMemoryActionsWire(data.executedMemoryActions),
       pendingMemoryActions: normalizeMemoryActionsWire(data.pendingMemoryActions),
@@ -705,6 +1048,7 @@ export async function agentChat(body: AgentChatRequestBody, options?: AgentChatO
               ? (obj.debugLlm as AgentChatLlmDebug)
               : undefined,
           viewerActions: normalizeViewerActionsWire(obj.viewerActions),
+          performanceMetrics: normalizePerformanceMetricsWire(obj.performanceMetrics),
           corpusCreatedPaths: normalizeCorpusCreatedPaths(obj.corpusCreatedPaths),
           executedMemoryActions: normalizeMemoryActionsWire(obj.executedMemoryActions),
           pendingMemoryActions: normalizeMemoryActionsWire(obj.pendingMemoryActions),
@@ -856,6 +1200,7 @@ function normalizeAgentActivityLogEntry(raw: unknown): AgentActivityLogEntry | n
     corpusCreatedPaths: Array.isArray(o.corpusCreatedPaths)
       ? o.corpusCreatedPaths.filter((p): p is string => typeof p === "string")
       : [],
+    performanceMetrics: normalizePerformanceMetricsWire(o.performanceMetrics),
     error: typeof o.error === "string" ? o.error : "",
   };
 }
@@ -911,6 +1256,16 @@ export async function saveMarkdownFile(name: string, content: string): Promise<v
   if (!r.ok) {
     const err = (await r.json().catch(() => ({}))) as { error?: string };
     throw new Error(err.error || `save markdown ${r.status}`);
+  }
+}
+
+export async function deleteMarkdownFile(name: string): Promise<void> {
+  const r = await fetch(`/api/markdown-file?${new URLSearchParams({ name })}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) {
+    const err = (await r.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error || `delete markdown ${r.status}`);
   }
 }
 

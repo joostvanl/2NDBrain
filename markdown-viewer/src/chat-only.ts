@@ -7,6 +7,7 @@ import {
   updateAgentChatSession,
   type AgentChatSession,
   type AgentChatTurn,
+  type AgentPerformanceMetrics,
   type CorpusActivityEvent,
 } from "./api";
 import { renderMarkdown } from "./markdown";
@@ -35,9 +36,32 @@ function chatTitleFrom(text: string): string {
 function activityText(ev: CorpusActivityEvent): string {
   if (ev.label) return ev.label;
   if (ev.phase === "read_file" && ev.path) return `Leest ${ev.path}`;
+  if (ev.phase === "read_outline" && ev.path) return `Leest koppen van ${ev.path}`;
+  if (ev.phase === "read_section" && ev.path) return `Leest sectie uit ${ev.path}`;
+  if (ev.phase === "read_memory_outline" && ev.path) return `Leest memory-koppen van ${ev.path}`;
+  if (ev.phase === "read_memory_section" && ev.path) return `Leest memory-sectie uit ${ev.path}`;
   if (ev.phase === "tool_call" && ev.path) return `Gebruikt ${ev.path}`;
   if (ev.phase === "web_search") return "Zoekt op internet";
   return ev.path ? `${ev.phase || "Activiteit"}: ${ev.path}` : ev.phase || "Corpus wordt geraadpleegd";
+}
+
+function formatMetricNumber(n: number | undefined): string {
+  return typeof n === "number" && Number.isFinite(n) ? new Intl.NumberFormat("nl-NL").format(Math.round(n)) : "n/a";
+}
+
+function formatDurationMs(ms: number | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return "n/a";
+  return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s` : `${Math.round(ms)}ms`;
+}
+
+function formatPerformanceStatus(metrics?: AgentPerformanceMetrics): string {
+  if (!metrics) return "";
+  const actualTokens = metrics.tokenUsage?.totalTokens;
+  const tokenText =
+    typeof actualTokens === "number" && actualTokens > 0
+      ? `${formatMetricNumber(actualTokens)} tokens`
+      : `~${formatMetricNumber(metrics.approxContextTokens)} contexttokens`;
+  return `Klaar in ${formatDurationMs(metrics.durationMs)} · LLM ${formatDurationMs(metrics.llmMs)} · ${formatMetricNumber(metrics.toolCallCount)} toolactie(s) · ${tokenText}`;
 }
 
 const app = document.querySelector<HTMLDivElement>("#chat-app");
@@ -273,6 +297,7 @@ async function submitMessage(): Promise<void> {
     history = [...history, { role: "assistant", content: result.reply || "(geen antwoord)", mode: "ask" }];
     await persistActiveChat();
     renderWebSearchState();
+    status.textContent = formatPerformanceStatus(result.performanceMetrics) || status.textContent;
   } catch (e) {
     const message = String((e as Error).message);
     history = [...history, { role: "assistant", content: `Er ging iets mis: ${message}`, mode: "ask" }];

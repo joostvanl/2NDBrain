@@ -47,8 +47,13 @@ services:
       REVIEWS_DIR: /data/files/.reviews
       DOCX_EXPORT_URL: http://docx-export:8790
       DOCX_EXPORT_TOKEN: ${DOCX_EXPORT_TOKEN:-}
+      # Agent (LLM): image bevat geen agent.config — zet in .env naast deze compose, of mount hieronder een bestand.
+      AGENT_API_KEY: ${AGENT_API_KEY:-}
+      AGENT_ENDPOINT: ${AGENT_ENDPOINT:-}
+      AGENT_MODEL: ${AGENT_MODEL:-}
     volumes:
       - ../Files:/data/files
+      # Optioneel (bestand moet op de host bestaan): - ./agent.config.json:/app/agent.config.json:ro
     depends_on:
       docx-export:
         condition: service_healthy

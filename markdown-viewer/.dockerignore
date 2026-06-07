@@ -3,3 +3,12 @@ dist
 npm-debug.log*
 .DS_Store
 _docx_extract*
+.env
+.env.local
+.env.docker.local
+.env.pi
+agent.config
+agent.config.json
+agent-chats.json
+agent-activity-logs.jsonl
+prompt-macros.json

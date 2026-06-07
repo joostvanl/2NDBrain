@@ -25,13 +25,115 @@ function getTurndown(): TurndownService {
         return `\n\n${htmlTableToMarkdown(node as HTMLTableElement)}\n\n`;
       },
     });
+    td.addRule("confluenceMacroPlaceholder", {
+      filter(node) {
+        return (
+          node.nodeName === "DIV" &&
+          node instanceof HTMLElement &&
+          node.classList.contains("mv-confluence-macro") &&
+          node.hasAttribute("data-confluence-macro-b64")
+        );
+      },
+      replacement(_content, node) {
+        const el = node as HTMLElement;
+        return `\n\n${el.outerHTML}\n\n`;
+      },
+    });
+    td.addRule("mermaidWrap", {
+      filter(node) {
+        return (
+          node.nodeName === "DIV" &&
+          node instanceof HTMLElement &&
+          node.classList.contains("mv-mermaid-wrap") &&
+          node.hasAttribute("data-mv-mermaid-source")
+        );
+      },
+      replacement(_content, node) {
+        const el = node as HTMLElement;
+        const raw = el.getAttribute("data-mv-mermaid-source");
+        if (!raw) return "\n\n";
+        try {
+          const source = decodeURIComponent(raw);
+          return `\n\n\`\`\`mermaid\n${source}\n\`\`\`\n\n`;
+        } catch {
+          return "\n\n";
+        }
+      },
+    });
+    td.addRule("chartJsWrap", {
+      filter(node) {
+        return (
+          node.nodeName === "DIV" &&
+          node instanceof HTMLElement &&
+          node.classList.contains("mv-chartjs-wrap") &&
+          node.hasAttribute("data-mv-chartjs-source")
+        );
+      },
+      replacement(_content, node) {
+        const el = node as HTMLElement;
+        const raw = el.getAttribute("data-mv-chartjs-source");
+        if (!raw) return "\n\n";
+        try {
+          const source = decodeURIComponent(raw);
+          return `\n\n\`\`\`chartjs\n${source}\n\`\`\`\n\n`;
+        } catch {
+          return "\n\n";
+        }
+      },
+    });
   }
   return td;
 }
 
+/**
+ * Zet door de viewer gerenderde diagram-/grafiekwrappers terug naar pre/code voordat Turndown draait.
+ * Zo gebruiken we de betrouwbare fencedCodeBlock-regel; anders kan een div met alleen canvas
+ * verlies van de JSON-definitie geven bij opslaan.
+ */
+function unwrapDiagramWrappersForTurndown(html: string): string {
+  const holder = document.createElement("div");
+  holder.innerHTML = html.trim();
+
+  const chartSelectors = ".mv-chartjs-wrap[data-mv-chartjs-source]";
+  holder.querySelectorAll(chartSelectors).forEach((el) => {
+    const raw = el.getAttribute("data-mv-chartjs-source");
+    if (!raw) return;
+    try {
+      const source = decodeURIComponent(raw);
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.className = "language-chartjs";
+      code.textContent = source;
+      pre.append(code);
+      el.replaceWith(pre);
+    } catch {
+      /* onbruikbaar attribuut */
+    }
+  });
+
+  holder.querySelectorAll(".mv-mermaid-wrap[data-mv-mermaid-source]").forEach((el) => {
+    const raw = el.getAttribute("data-mv-mermaid-source");
+    if (!raw) return;
+    try {
+      const source = decodeURIComponent(raw);
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.className = "language-mermaid";
+      code.textContent = source;
+      pre.append(code);
+      el.replaceWith(pre);
+    } catch {
+      /* */
+    }
+  });
+
+  return holder.innerHTML;
+}
+
 export function htmlFragmentToMarkdown(html: string): string {
   const service = getTurndown();
-  const out = service.turndown(html).replace(/\u00a0/g, " ").trim();
+  const normalized = unwrapDiagramWrappersForTurndown(html);
+  const out = service.turndown(normalized).replace(/\u00a0/g, " ").trim();
   return out;
 }
 

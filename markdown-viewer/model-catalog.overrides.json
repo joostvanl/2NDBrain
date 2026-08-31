@@ -1,0 +1,11 @@
+{
+  "gpt-4o-mini": {
+    "label": "Snel en goedkoop",
+    "toolCalling": true,
+    "phaseAffinity": {
+      "retrieval": 8,
+      "utility": 9,
+      "simple": 7
+    }
+  }
+}

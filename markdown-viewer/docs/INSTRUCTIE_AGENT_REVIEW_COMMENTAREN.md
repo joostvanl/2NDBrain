@@ -162,6 +162,8 @@ De server past een patch standaard alleen toe als elke `find` exact één keer v
 
 Voor expliciet documentbrede terminologie-opdrachten mag de LLM `replaceAll: true` zetten. Dan vervangt de server alle exacte voorkomens van `find`. Gebruik dit alleen bij duidelijke opdrachten zoals: “gebruik door het hele document heen `Problem Management` in plaats van `Probleembeheer`”.
 
+**Section-scoped patches (Nexus):** optioneel kun je per change ook `"sectionId"` (heading, id of headingPath uit outline), `"beforeSnippet"` (validatie vóór apply) en `"rationale"` (verplicht op beschermde templates zoals SLA/DAP) meegeven. De server past de patch dan alleen binnen die sectie toe. Legacy `find`/`replace` blijft werken.
+
 **Let op (ankers):** het commentaar wordt in de viewer onder andere aan tekst gekoppeld via `quote` / `prefix` / `suffix`. Als je het document zo wijzigt dat dat fragment **verdwijnt of anders wordt**, kan de markering in de viewer later niet meer kloppen. De JSON en je wijzigingen zijn dan nog steeds geldig; alleen de visuele koppeling in de editor kan haperen tot iemand het commentaar opnieuw uitlijnt.
 
 ### Stap E — Reactie op het oorspronkelijke commentaar

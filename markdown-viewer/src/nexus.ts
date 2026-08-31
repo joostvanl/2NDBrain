@@ -2,10 +2,13 @@ import "./nexus.css";
 import {
   agentChat,
   fetchMarkdownFile,
+  fetchMarkdownFileResolved,
   fetchMarkdownIndex,
   saveMarkdownFile,
+  searchCorpus,
   type AgentChatMode,
   type AgentChatTurn,
+  type CorpusSearchResult,
   type MarkdownFileDetail,
 } from "./api";
 import { renderMarkdown } from "./markdown";
@@ -50,6 +53,8 @@ let activePath = "";
 let currentMarkdown = "";
 let savedMarkdown = "";
 let filter = "";
+let corpusSearchResults: CorpusSearchResult[] = [];
+let corpusSearchTimer: ReturnType<typeof setTimeout> | null = null;
 let chatHistory: AgentChatTurn[] = [];
 let busy = false;
 
@@ -59,7 +64,7 @@ const brand = el("div", "nx-brand");
 brand.append(el("span", "nx-brand-mark", "N"), el("span", "", "Nexus Editor"));
 
 const searchWrap = el("div", "nx-search");
-const commandBtn = el("button", "nx-command-btn", "Search or run command... Ctrl+K");
+const commandBtn = el("button", "nx-command-btn", "Zoek in corpus… Ctrl+K");
 commandBtn.type = "button";
 searchWrap.append(commandBtn);
 
@@ -162,7 +167,7 @@ const commandOverlay = el("div", "nx-command-overlay");
 commandOverlay.hidden = true;
 const palette = el("div", "nx-palette");
 const paletteInput = document.createElement("input");
-paletteInput.placeholder = "Typ een commando of bestandsnaam...";
+paletteInput.placeholder = "Zoek op onderwerp, titel of bestandsnaam…";
 paletteInput.setAttribute("aria-label", "Command palette");
 const commandList = el("div", "nx-command-list");
 palette.append(paletteInput, commandList);
@@ -252,14 +257,15 @@ async function openFile(path: string): Promise<void> {
   if (!(await maybeSaveBeforeSwitch())) return;
   setBusy(true);
   try {
-    activePath = path;
-    currentMarkdown = await fetchMarkdownFile(path);
+    const resolved = await fetchMarkdownFileResolved(path);
+    activePath = resolved.path;
+    currentMarkdown = resolved.content;
     savedMarkdown = currentMarkdown;
     editor.value = currentMarkdown;
-    docTitle.textContent = fileTitle(path);
+    docTitle.textContent = fileTitle(resolved.path);
     editor.placeholder = "";
     renderFiles();
-    setStatus(path);
+    setStatus(resolved.path === path ? resolved.path : `${resolved.path} (via ${path})`);
   } catch (e) {
     setStatus(`Openen mislukt: ${(e as Error).message}`);
   } finally {
@@ -271,10 +277,15 @@ async function saveActiveFile(): Promise<void> {
   if (!activePath) return;
   setBusy(true);
   try {
-    await saveMarkdownFile(activePath, editor.value);
+    const saved = await saveMarkdownFile(activePath, editor.value);
+    if (saved.movedTo && saved.movedTo !== activePath) {
+      activePath = saved.movedTo;
+      docTitle.textContent = fileTitle(activePath);
+      await loadFiles();
+    }
     currentMarkdown = editor.value;
     savedMarkdown = editor.value;
-    setStatus(`Opgeslagen: ${activePath}`);
+    setStatus(saved.movedTo ? `Verplaatst en opgeslagen: ${activePath}` : `Opgeslagen: ${activePath}`);
   } catch (e) {
     setStatus(`Opslaan mislukt: ${(e as Error).message}`);
   } finally {
@@ -355,6 +366,7 @@ function aiDraft(): void {
 function openCommandPalette(): void {
   commandOverlay.hidden = false;
   paletteInput.value = "";
+  corpusSearchResults = [];
   renderCommands();
   requestAnimationFrame(() => paletteInput.focus());
 }
@@ -379,19 +391,70 @@ function commands(): Command[] {
   ];
 }
 
+function scheduleCorpusSearch(query: string): void {
+  if (corpusSearchTimer) clearTimeout(corpusSearchTimer);
+  const q = query.trim();
+  if (q.length < 2) {
+    corpusSearchResults = [];
+    renderCommands();
+    return;
+  }
+  corpusSearchTimer = setTimeout(() => {
+    corpusSearchTimer = null;
+    void searchCorpus(q, { limit: 12, scope: "both" })
+      .then((payload) => {
+        corpusSearchResults = payload.results || [];
+        renderCommands();
+      })
+      .catch(() => {
+        corpusSearchResults = [];
+        renderCommands();
+      });
+  }, 180);
+}
+
 function renderCommands(): void {
   const q = paletteInput.value.trim().toLowerCase();
   const visible = commands().filter((cmd) => !q || cmd.label.toLowerCase().includes(q) || cmd.hint.toLowerCase().includes(q));
   commandList.replaceChildren();
-  for (const cmd of visible.slice(0, 40)) {
-    const item = el("button", "nx-command-item");
-    item.type = "button";
-    item.innerHTML = `<strong>${cmd.label}</strong><br><span>${cmd.hint}</span>`;
-    item.addEventListener("click", async () => {
-      closeCommandPalette();
-      await cmd.run();
-    });
-    commandList.append(item);
+
+  if (q.length >= 2 && corpusSearchResults.length) {
+    const heading = el("div", "nx-command-section", "Corpus");
+    commandList.append(heading);
+    for (const hit of corpusSearchResults.slice(0, 12)) {
+      const openPath = hit.isRedirect && hit.redirectTo ? hit.redirectTo : hit.path;
+      const item = el("button", "nx-command-item");
+      item.type = "button";
+      const scopeLabel = hit.scope === "memory" ? "memory" : "werk";
+      item.innerHTML = `<strong>${hit.title}</strong><br><span>${scopeLabel} · ${openPath}${hit.docId ? ` · ${hit.docId}` : ""}</span>`;
+      item.addEventListener("click", async () => {
+        closeCommandPalette();
+        if (hit.scope === "memory") {
+          window.location.href = `/?memory=${encodeURIComponent(openPath)}`;
+          return;
+        }
+        await openFile(openPath);
+      });
+      commandList.append(item);
+    }
+  }
+
+  if (visible.length) {
+    if (q.length >= 2 && corpusSearchResults.length) {
+      commandList.append(el("div", "nx-command-section", "Commando's & bestanden"));
+    }
+    for (const cmd of visible.slice(0, 40)) {
+      const item = el("button", "nx-command-item");
+      item.type = "button";
+      item.innerHTML = `<strong>${cmd.label}</strong><br><span>${cmd.hint}</span>`;
+      item.addEventListener("click", async () => {
+        closeCommandPalette();
+        await cmd.run();
+      });
+      commandList.append(item);
+    }
+  } else if (!corpusSearchResults.length) {
+    commandList.append(el("div", "nx-status", "Geen resultaten."));
   }
 }
 
@@ -428,7 +491,10 @@ codeBtn.addEventListener("click", () => wrapSelection("`"));
 collapseLeftBtn.addEventListener("click", toggleLeft);
 collapseChatBtn.addEventListener("click", toggleChat);
 commandBtn.addEventListener("click", openCommandPalette);
-paletteInput.addEventListener("input", renderCommands);
+paletteInput.addEventListener("input", () => {
+  scheduleCorpusSearch(paletteInput.value);
+  renderCommands();
+});
 commandOverlay.addEventListener("mousedown", (ev) => {
   if (ev.target === commandOverlay) closeCommandPalette();
 });

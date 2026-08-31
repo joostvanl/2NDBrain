@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Confluence toegang — Proof of Concept</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #171e27;
+      --line: #2a3542;
+      --text: #e8eef4;
+      --muted: #93a0ae;
+      --accent: #6ea8fe;
+      --ok: #3dd68c;
+      --ok-bg: #123526;
+      --bad: #ff7b7b;
+      --bad-bg: #3a1717;
+      --input: #0c1015;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font: 15px/1.5 "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #1c2b44 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 40px 20px 64px; }
+    h1 { margin: 0 0 8px; font-size: 1.55rem; letter-spacing: -0.02em; }
+    .lede { color: var(--muted); margin: 0 0 22px; }
+    form, .result, .status {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px;
+    }
+    .status { margin-bottom: 16px; }
+    .status p { margin: 0; color: var(--muted); }
+    .status strong { color: var(--text); }
+    fieldset {
+      margin: 4px 0 18px;
+      padding: 14px 14px 2px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    legend { padding: 0 6px; color: var(--accent); font-weight: 650; }
+    label { display: block; margin: 0 0 6px; font-weight: 600; }
+    .hint { color: var(--muted); font-size: 13px; margin: -2px 0 10px; }
+    input, textarea {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--input);
+      color: var(--text);
+      font: inherit;
+      margin-bottom: 16px;
+    }
+    textarea { min-height: 88px; resize: vertical; font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; }
+    input:focus, textarea:focus { outline: 2px solid #3b6ea8; border-color: transparent; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 8px;
+      padding: 11px 16px;
+      font: inherit;
+      font-weight: 650;
+      background: var(--accent);
+      color: #081018;
+      cursor: pointer;
+    }
+    button.secondary { background: #2a3542; color: var(--text); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .result { margin-top: 18px; display: none; }
+    .result.visible { display: block; }
+    .result.ok { border-color: #245c40; background: linear-gradient(180deg, var(--ok-bg), var(--panel)); }
+    .result.bad { border-color: #6a2a2a; background: linear-gradient(180deg, var(--bad-bg), var(--panel)); }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .result.ok .badge { background: #1c5a3a; color: var(--ok); }
+    .result.bad .badge { background: #5a2020; color: var(--bad); }
+    h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    dl { display: grid; grid-template-columns: 150px 1fr; gap: 6px 12px; margin: 16px 0 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; word-break: break-word; }
+    ul, .steps { margin: 8px 0 0; padding-left: 18px; }
+    .steps { color: var(--muted); }
+    code { font-family: Consolas, "Cascadia Mono", monospace; font-size: 13px; }
+    .note { margin-top: 22px; color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Confluence toegang</h1>
+    <p class="lede">
+      PAT-only en de hosted-tools formulierlogin komen niet door Azure AD.
+      Deze PoC hergebruikt daarom een <strong>echte browsersessie</strong>.
+    </p>
+
+    <section class="status" id="status">
+      <p>Status laden…</p>
+    </section>
+
+    <form id="form">
+      <label for="baseUrl">Confluence base URL</label>
+      <input id="baseUrl" name="baseUrl" type="url" required value="https://confluence.hosted-tools.com" />
+
+      <fieldset>
+        <legend>1. Browser-sessie (aanbevolen)</legend>
+        <p class="hint">
+          Opent een apart Edge-profiel met debug-poort. Log daar één keer in op Confluence
+          (gewoon SSO/MFA). Daarna haalt de PoC de cookies op. Je gewone Edge blijft onaangeroerd.
+        </p>
+        <div class="actions" style="margin-bottom: 16px;">
+          <button type="button" class="secondary" id="startEdge">Open Confluence in PoC-Edge</button>
+        </div>
+        <label for="cookie">Of plak Cookie-header uit je gewone Edge</label>
+        <p class="hint">F12 → Network → request naar confluence.hosted-tools.com → header <code>Cookie</code> kopiëren.</p>
+        <textarea id="cookie" name="cookie" placeholder="JSESSIONID=…; AHTSID=…"></textarea>
+      </fieldset>
+
+      <label for="pat">Personal Access Token (optioneel)</label>
+      <p class="hint">Wordt meegestuurd als Bearer, naast de cookie. Alleen PAT werkt hier niet.</p>
+      <input id="pat" name="pat" type="password" autocomplete="off" placeholder="ATATT… of DC PAT" />
+
+      <fieldset>
+        <legend>Fallback — SSO-formulier</legend>
+        <p class="hint">Eerder getest: login lukt, maar levert alleen Azure AD-cookies. Alleen gebruiken als extra poging.</p>
+        <label for="ssoUser">Gebruikersnaam</label>
+        <input id="ssoUser" name="ssoUser" type="text" autocomplete="username" placeholder="bijv. joostvl" />
+        <label for="ssoPassword">Wachtwoord</label>
+        <input id="ssoPassword" name="ssoPassword" type="password" autocomplete="current-password" />
+      </fieldset>
+
+      <button type="submit" id="submit">Controleer toegang</button>
+    </form>
+
+    <section class="result" id="result" hidden></section>
+    <p class="note">Cookies blijven in het geheugen van deze lokale server. Het Edge-profiel staat in <code>poc-confluence/.edge-profile</code> en wordt niet gecommit.</p>
+  </main>
+  <script>
+    const form = document.getElementById("form");
+    const resultEl = document.getElementById("result");
+    const submit = document.getElementById("submit");
+    const startEdge = document.getElementById("startEdge");
+    const statusEl = document.getElementById("status");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+    function row(label, value) {
+      if (value == null || value === "") return "";
+      return `<dt>${label}</dt><dd>${value}</dd>`;
+    }
+
+    async function refreshStatus() {
+      try {
+        const data = await (await fetch("/api/status")).json();
+        const cdp = data.cdp?.ok
+          ? `PoC-Edge verbonden (${escapeHtml(data.cdp.browser || "Edge")} · poort ${data.cdp.port})`
+          : `PoC-Edge niet verbonden (poort ${data.cdp?.port || 9224})`;
+        const cached = data.cachedCookie?.has
+          ? ` · cookies in geheugen: ${escapeHtml((data.cachedCookie.keys || []).join(", "))}`
+          : "";
+        statusEl.innerHTML = `<p><strong>${cdp}</strong>${cached}</p>`;
+      } catch {
+        statusEl.innerHTML = "<p>Status onbekend — is de lokale PoC-server actief?</p>";
+      }
+    }
+
+    function render(data) {
+      const user = data.whoami?.user || {};
+      const pages = data.search?.pages || [];
+      const pageList = pages.length
+        ? `<ul>${pages.map((p) => `<li>${escapeHtml(p.title)} <code>#${escapeHtml(p.id || "")}</code></li>`).join("")}</ul>`
+        : "";
+      const steps = Array.isArray(data.steps) && data.steps.length
+        ? `<ol class="steps">${data.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>`
+        : "";
+      resultEl.className = `result visible ${data.ok ? "ok" : "bad"}`;
+      resultEl.hidden = false;
+      resultEl.innerHTML = `
+        <span class="badge">${data.ok ? "OK" : "GEEN TOEGANG"}</span>
+        <h2>${escapeHtml(data.title || (data.ok ? "Toegang bevestigd" : "Check mislukt"))}</h2>
+        <p>${escapeHtml(data.detail || "")}</p>
+        ${steps}
+        <dl>
+          ${row("Auth", escapeHtml(data.auth || ""))}
+          ${row("Base URL", escapeHtml(data.baseUrl || ""))}
+          ${row("Cookie-bron", escapeHtml(data.cookie?.source || ""))}
+          ${row("Cookies", data.cookie?.cookieKeys?.length ? escapeHtml(data.cookie.cookieKeys.join(", ")) : "")}
+          ${row("CDP", data.browser?.cdpAvailable ? "verbonden" : data.browser ? "niet verbonden" : "")}
+          ${row("SSO-formulier", data.sso ? (data.sso.ok ? `OK (${data.sso.ms} ms)` : escapeHtml(data.sso.error || "mislukt")) : "")}
+          ${row("Whoami status", data.whoami ? `${data.whoami.status} (${data.whoami.ms} ms)` : "")}
+          ${row("JSON", data.whoami ? (data.whoami.json ? "ja" : "nee") : "")}
+          ${row("SSO-intercept", data.whoami?.ssoIntercept ? "ja — auth.hosted-tools.com" : data.whoami ? "nee" : "")}
+          ${row("Redirect", escapeHtml(data.whoami?.location || ""))}
+          ${row("Gebruiker", escapeHtml(user.displayName || ""))}
+          ${row("Username", escapeHtml(user.username || ""))}
+          ${row("E-mail", escapeHtml(user.email || ""))}
+          ${row("Search status", data.search ? `${data.search.status} · ${data.search.size ?? 0} pagina’s` : "niet uitgevoerd")}
+          ${row("Snippet", escapeHtml(data.whoami?.snippet || data.search?.snippet || ""))}
+        </dl>
+        ${pageList}
+      `;
+    }
+
+    startEdge.addEventListener("click", async () => {
+      startEdge.disabled = true;
+      startEdge.textContent = "Edge starten…";
+      try {
+        const response = await fetch("/api/start-edge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ baseUrl: document.getElementById("baseUrl").value }),
+        });
+        const data = await response.json();
+        await refreshStatus();
+        render({
+          ok: Boolean(data.ok),
+          title: data.ok ? (data.alreadyRunning ? "PoC-Edge was al open" : "PoC-Edge gestart") : "PoC-Edge niet gestart",
+          detail: data.ok
+            ? "Log in op Confluence in het Edge-venster. Als je de wiki ziet, klik hier Controleer toegang."
+            : data.error || "Onbekende fout",
+          steps: data.endpoint ? [`CDP: ${data.endpoint}`] : [],
+        });
+      } catch (error) {
+        render({ ok: false, title: "PoC-Edge niet gestart", detail: error instanceof Error ? error.message : String(error) });
+      } finally {
+        startEdge.disabled = false;
+        startEdge.textContent = "Open Confluence in PoC-Edge";
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      submit.textContent = "Bezig…";
+      resultEl.hidden = true;
+      try {
+        const response = await fetch("/api/check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            baseUrl: document.getElementById("baseUrl").value,
+            pat: document.getElementById("pat").value,
+            cookie: document.getElementById("cookie").value,
+            ssoUser: document.getElementById("ssoUser").value,
+            ssoPassword: document.getElementById("ssoPassword").value,
+          }),
+        });
+        render(await response.json());
+        await refreshStatus();
+      } catch (error) {
+        render({ ok: false, title: "Lokale PoC niet bereikbaar", detail: error instanceof Error ? error.message : String(error) });
+      } finally {
+        submit.disabled = false;
+        submit.textContent = "Controleer toegang";
+      }
+    });
+
+    refreshStatus();
+  </script>
+</body>
+</html>

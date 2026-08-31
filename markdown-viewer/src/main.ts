@@ -2,14 +2,18 @@ import "./style.css";
 import { defaultTemplate, mergeTemplate } from "./defaultTemplate";
 import type { ViewerTemplate } from "./templateTypes";
 import { applyCssVars, templateToCssVars } from "./applyTemplate";
+import { applyProjectColorToElement, projectColorForName } from "./project-colors";
 import {
   agentChat,
   applyAgentMemoryActions,
   clearAgentLogs,
   cleanupAgentTranscript,
   createPromptMacro,
+  createEmailAgentReplyDraft,
+  createKanbanTask,
   createAgentChatSession,
   createMarkdownFolder,
+  createNewWorkDocumentDraft,
   deleteAgentChatSession,
   deleteMarkdownFile,
   deletePromptMacro,
@@ -17,16 +21,27 @@ import {
   fetchAgentChatSessions,
   fetchAgentInstructions,
   fetchAgentLogs,
+  fetchAgentModelCatalog,
   fetchAgentModels,
+  fetchModelRouterStats,
   fetchConfluencePage,
+  startConfluenceBrowserSession,
+  syncConfluenceBrowserSession,
   fetchDocxTemplates,
   fetchDocxTemplatePlaceholders,
+  fetchEmailAgentNotifications,
+  fetchEmailAgentStatus,
+  fetchKanbanBoard,
+  fetchKanbanMeta,
   fetchMemoryFile,
   fetchMemoryIndex,
+  fetchNexusDebugLogs,
   exportMarkdownToDocx,
   fetchAgentActivityLogs,
   fetchMarkdownBackupFile,
+  fetchCorpusOrganizerActivity,
   fetchMarkdownFile,
+  fetchMarkdownFileResolved,
   fetchMarkdownIndex,
   fetchReviewComments,
   fetchSecondBrainContext,
@@ -35,35 +50,70 @@ import {
   fetchTemplate,
   fetchTemplateFiles,
   importDocxToMarkdown,
+  ingestKanbanSignal,
+  isNetworkFetchFailure,
+  KANBAN_STATUSES,
   linkSecondBrainUnlinkedMentions,
+  moveKanbanTask,
+  recoverAgentDocumentProposal,
   renameMarkdownPath,
   promoteAgentChatSession,
   promoteStaleAgentChats,
+  readOutlookMail,
   rebuildCorpusIndex,
   revertAgentMemoryActions,
   revertMarkdownToLastBackup,
+  runEmailAgentScan,
   runAgent,
   saveMarkdownFile,
   saveAgentConfig,
+  type SaveMarkdownFileResult,
   saveConfluencePage,
+  saveEmailAgentConfig,
   saveAgentInstructions,
   saveReviewComments,
   searchConfluencePages,
+  searchCorpus,
+  summarizeAgentChatSession,
   type AgentChatMode,
   type AgentChatSession,
   type AgentChatTurn,
   type AgentMemoryAction,
   type AgentPerformanceMetrics,
+  type ModelTraceEntry,
   type ConfluenceSearchResult,
+  type CorpusSearchResult,
   type CorpusActivityEvent,
+  type EmailAgentConfig,
+  type EmailAgentNotification,
+  type KanbanBoardPayload,
+  type KanbanCommentThread,
+  type KanbanStatus,
+  type KanbanTask,
+  type KanbanTaskInput,
+  type OutlookMailReadItem,
   type PromptMacro,
   type ViewerAgentAction,
+  appendNexusErrorLog,
+  addKanbanCommentReply,
+  addKanbanCommentThread,
+  fetchKanbanComments,
+  updateEmailAgentNotification,
+  updateKanbanTask,
   updatePromptMacro,
   updateAgentChatSession,
 } from "./api";
 import { destroyChartsInRoot, runChartJsInRoot } from "./chartJsBlocks";
+import {
+  extractHiddenDocumentPrefix,
+  isWorkDraftPath,
+  mergeHiddenDocumentPrefix,
+  stripHiddenDocumentPrefix,
+} from "./document-meta";
 import { htmlFragmentToMarkdown, markdownHtmlTablesToMarkdown } from "./htmlToMarkdown";
 import { runMermaidInRoot } from "./mermaidDiagrams";
+import { inferNexusChatMode, shouldOfferDocumentEditMode } from "./nexus/intent";
+import { nexusSpeechSupported, speakNexusReply, stopNexusSpeech } from "./nexus/speech";
 import { renderMarkdown, tocDisplayLabel, type TocEntry } from "./markdown";
 import { MV_CHANGE_NEW_CLASS, MV_CHANGE_OLD_CLASS } from "./reviewChangeDom";
 import {
@@ -358,19 +408,6 @@ const EXTERNAL_AGENT_VIRTUAL_PREFIX = "_mv_external/";
 
 const AGENT_DEBUG_LLM_STORAGE_KEY = "mv.agentDebugLlm";
 
-const AGENT_REPLY_MARKDOWN_STORAGE_KEY = "mv.agentReplyMarkdown";
-
-function readStoredAgentReplyMarkdown(): boolean {
-  try {
-    const v = localStorage.getItem(AGENT_REPLY_MARKDOWN_STORAGE_KEY);
-    if (v === "0") return false;
-    if (v === "1") return true;
-  } catch {
-    /* private mode / storage disabled */
-  }
-  return true;
-}
-
 function readAgentDebugLlm(): boolean {
   try {
     return localStorage.getItem(AGENT_DEBUG_LLM_STORAGE_KEY) === "1";
@@ -391,7 +428,11 @@ export async function bootstrap() {
   const app = document.getElementById("app");
   if (!app) throw new Error("#app ontbreekt");
 
+  type MainAppView = "documents" | "email" | "kanban";
+
   let currentMd = "";
+  /** Corpus-meta comment uit currentMd; blijft behouden bij visuele editor-opslag. */
+  let hiddenDocumentPrefix = "";
   let currentMerged: ViewerTemplate = defaultTemplate;
   let templatesAvailable = false;
 
@@ -422,9 +463,13 @@ export async function bootstrap() {
   let activeAgentChatId = "";
   let agentChatHistory: AgentChatTurn[] = [];
   let promptMacros: PromptMacro[] = [];
+  /** Macro die submitAgentChat() via Uitvoeren start; cleared na het lezen in submitAgentChat. */
+  let pendingPromptMacroRun: { id: string; mode: AgentChatMode } | null = null;
   let agentChatRequestBusy = false;
   let pendingMemoryActions: AgentMemoryAction[] = [];
   let revertibleMemoryActions: AgentMemoryAction[] = [];
+  let agentChatInlineActivities: { line: string; metrics?: boolean; model?: boolean }[] = [];
+  let agentChatActivityAnchorIndex: number | null = null;
   let memoryPanelVisible = false;
   let memoryMarkdownPaths: string[] = [];
   let agentChatSpeechRec: AgentSpeechRecognition | null = null;
@@ -441,6 +486,13 @@ export async function bootstrap() {
   let corpusMarkdownFolders: string[] = [];
   /** Welke mappen (relatief pad, bv. `01-managed-services/handouts`) zijn uitgeklapt. Standaard leeg = alles ingeklapt. */
   const fileTreeExpandedPaths = new Set<string>();
+  const CORPUS_ORGANIZER_POLL_MS = 5000;
+  let lastSeenCorpusOrganizerMoveAt = Date.now();
+  let corpusOrganizerPollBusy = false;
+  /** Was het zoekveld actief (filter of corpus-zoek)? Gebruikt om bij leegmaken alles weer in te klappen. */
+  let fileTreeFilterHadQuery = false;
+  /** Eén refresh overslaan met auto-uitklappen na zoeken stoppen. */
+  let collapseTreeAfterSearchClear = false;
   /** Pad van een .md dat uit de boom gesleept wordt (HTML5 drag); drop → `renameMarkdownPath`. */
   let treeDragMarkdownPath: string | null = null;
   /** `visual` = WYSIWYG; `code` = ruwe markdown in textarea. */
@@ -449,6 +501,9 @@ export async function bootstrap() {
   let editorVisualWrap: HTMLElement | null = null;
   let editorCodeWrap: HTMLElement | null = null;
   const MAX_AGENT_CHAT_HISTORY = 40;
+  const AUTO_SUMMARIZE_CHAT_MIN_MESSAGES = 24;
+  const AUTO_SUMMARIZE_CHAT_MIN_CHARS = 45000;
+  const AUTO_SUMMARIZE_KEEP_RECENT_TURNS = 6;
   const shell = el("div", "mv-app");
   const toolbar = el("header", "mv-toolbar");
 
@@ -472,9 +527,9 @@ export async function bootstrap() {
   mobileFileTreeBtn.type = "button";
   mobileFileTreeBtn.setAttribute("aria-label", "Bestandsboom openen");
   const mobileDocName = el("span", "mv-mobile-doc-name", "—");
-  const mobileChatBtn = el("button", "mv-mobile-icon-btn", "Agent");
+  const mobileChatBtn = el("button", "mv-mobile-icon-btn", "Nexus");
   mobileChatBtn.type = "button";
-  mobileChatBtn.setAttribute("aria-label", "Agent-chat openen");
+  mobileChatBtn.setAttribute("aria-label", "Nexus-chat openen");
   const mobileMenuBtn = el("button", "mv-mobile-icon-btn mv-mobile-icon-btn--menu", "Menu");
   mobileMenuBtn.type = "button";
   mobileMenuBtn.setAttribute("aria-label", "Menu openen");
@@ -485,6 +540,10 @@ export async function bootstrap() {
   browseFilesBtn.type = "button";
   browseFilesBtn.title =
     "Open een .md-bestand op je schijf (Edge of Chrome). Geen kopie in Files/: opslaan schrijft terug naar dat bestand.";
+  const newDocBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Nieuw document");
+  newDocBtn.type = "button";
+  newDocBtn.title =
+    "Open een leeg naamloos document. Vul het via de editor of Nexus; Corpus Gardener geeft het daarna een naam en plek.";
   const pasteMdBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Plakken");
   pasteMdBtn.type = "button";
   pasteMdBtn.title =
@@ -507,18 +566,27 @@ export async function bootstrap() {
   const confluenceSearchBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Zoek Confluence");
   confluenceSearchBtn.type = "button";
   confluenceSearchBtn.title = "Zoek Confluence-pagina's via de server-side PAT en importeer een gevonden pagina.";
+  const emailAgentBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "E-mail");
+  emailAgentBtn.type = "button";
+  emailAgentBtn.title = "Open het e-mailagent-notificatiecentrum.";
+  const kanbanBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Kanban");
+  kanbanBtn.type = "button";
+  kanbanBtn.title = "Open de centrale Actie-Kanban.";
   const printBtn = el("button", "mv-tb-btn mv-tb-btn--quiet", "Afdruk");
   printBtn.type = "button";
   printBtn.title =
     "Echte nieuwe papier-/PDF-pagina’s bij # en ## zie je in het afdrukvoorbeeld of PDF; op het scherm tonen witte blokken tussen hoofdstukken.";
   actions.append(
     browseFilesBtn,
+    newDocBtn,
     pasteMdBtn,
     settingsBtn,
     wordExportBtn,
     docxImportBtn,
     confluenceImportBtn,
     confluenceSearchBtn,
+    emailAgentBtn,
+    kanbanBtn,
     printBtn,
   );
 
@@ -722,17 +790,19 @@ export async function bootstrap() {
 
   const bodyWrap = el("div", "mv-body-wrap");
   const agentChatPanel = el("aside", "mv-agent-chat");
-  agentChatPanel.setAttribute("aria-label", "Agent-chat");
+  agentChatPanel.setAttribute("aria-label", "Nexus-chat");
   const agentChatHead = el("div", "mv-agent-chat-head");
   const agentChatTitleRow = el("div", "mv-agent-chat-title-row");
-  const agentChatTitle = el("h2", "mv-agent-chat-title", "Agent");
+  const agentChatTitle = el("h2", "mv-agent-chat-title", "Nexus");
   const agentChatClearBtn = el("button", "mv-agent-chat-clear mv-ribbon-btn mv-ribbon-btn--ghost", "Wissen");
   agentChatClearBtn.type = "button";
   agentChatClearBtn.title = "Chatgeschiedenis in dit paneel leegmaken";
   const agentChatCloseBtn = el("button", "mv-agent-chat-close", "Sluiten");
   agentChatCloseBtn.type = "button";
-  agentChatCloseBtn.setAttribute("aria-label", "Agent-overlay sluiten");
+  agentChatCloseBtn.setAttribute("aria-label", "Nexus-overlay sluiten");
   agentChatTitleRow.append(agentChatTitle, agentChatClearBtn, agentChatCloseBtn);
+  const agentChatContextLine = el("div", "mv-agent-chat-context");
+  agentChatContextLine.setAttribute("aria-live", "polite");
   const agentChatSessionRow = el("div", "mv-agent-chat-session-row");
   const agentChatSessionSelect = document.createElement("select");
   agentChatSessionSelect.className = "mv-agent-chat-session-select";
@@ -748,52 +818,26 @@ export async function bootstrap() {
   agentChatDeleteBtn.title = "Actieve chat verwijderen";
   agentChatSessionRow.append(agentChatSessionSelect, agentChatNewBtn, agentChatRenameBtn, agentChatDeleteBtn);
   const agentChatModes = el("div", "mv-agent-chat-modes");
+  agentChatModes.hidden = true;
   agentChatModes.setAttribute("role", "group");
-  agentChatModes.setAttribute("aria-label", "Chatmodus");
-  const agentModeAgentBtn = el("button", "mv-agent-chat-mode mv-agent-chat-mode--active", "Agent");
+  agentChatModes.setAttribute("aria-label", "Interne Nexus-modus");
+  const agentModeAgentBtn = el("button", "mv-agent-chat-mode mv-agent-chat-mode--active", "Nexus");
   agentModeAgentBtn.type = "button";
   agentModeAgentBtn.setAttribute("aria-pressed", "true");
   agentModeAgentBtn.title =
     "Laat de LLM het document aanpassen (find/replace-patches). Optioneel: selecteer eerst tekst voor context. Akkoord / Niet akkoord verschijnen onder het agentantwoord in het chatvenster.";
-  const agentModeAskBtn = el("button", "mv-agent-chat-mode", "Ask");
+  const agentModeAskBtn = el("button", "mv-agent-chat-mode", "Vraag");
   agentModeAskBtn.type = "button";
   agentModeAskBtn.setAttribute("aria-pressed", "false");
   agentModeAskBtn.title = "Alleen vragen en uitleg; het document wordt niet automatisch aangepast.";
   agentChatModes.append(agentModeAgentBtn, agentModeAskBtn);
-  const agentCorpusWideRow = el("label", "mv-agent-corpus-row");
-  agentCorpusWideRow.setAttribute("for", "mv-agent-corpus-wide");
-  agentCorpusWideRow.title =
-    "Alleen bij Ask: antwoord op basis van alle Markdown-bestanden in Files via een automatische index (.mv-index).";
-  const agentCorpusWideCheckbox = document.createElement("input");
-  agentCorpusWideCheckbox.type = "checkbox";
-  agentCorpusWideCheckbox.id = "mv-agent-corpus-wide";
-  const agentCorpusWideText = el("span", "mv-agent-corpus-row-text", "Hele bibliotheek (corpus)");
-  agentCorpusWideRow.append(agentCorpusWideCheckbox, agentCorpusWideText);
-  agentCorpusWideRow.hidden = true;
-  const agentWebSearchRow = el("label", "mv-agent-corpus-row");
-  agentWebSearchRow.setAttribute("for", "mv-agent-web-search");
-  agentWebSearchRow.title =
-    "Alleen bij Ask: laat de server via Tavily actuele informatie op internet zoeken. Vereist TAVILY_API_KEY in .env/.env.local.";
-  const agentWebSearchCheckbox = document.createElement("input");
-  agentWebSearchCheckbox.type = "checkbox";
-  agentWebSearchCheckbox.id = "mv-agent-web-search";
-  const agentWebSearchText = el("span", "mv-agent-corpus-row-text", "Internet zoeken (Tavily)");
-  agentWebSearchRow.append(agentWebSearchCheckbox, agentWebSearchText);
-  agentWebSearchRow.hidden = true;
-  const agentReplyMarkdownRow = el("label", "mv-agent-markdown-row");
-  agentReplyMarkdownRow.setAttribute("for", "mv-agent-reply-markdown");
-  agentReplyMarkdownRow.title =
-    "Aan: het model mag Markdown in chat-antwoorden gebruiken en de viewer toont ze opgemaakt. Uit: het model moet platte tekst antwoorden (geen koppen, lijsten of code-opmaak).";
-  const agentReplyMarkdownCheckbox = document.createElement("input");
-  agentReplyMarkdownCheckbox.type = "checkbox";
-  agentReplyMarkdownCheckbox.id = "mv-agent-reply-markdown";
-  agentReplyMarkdownCheckbox.checked = readStoredAgentReplyMarkdown();
-  const agentReplyMarkdownText = el("span", "mv-agent-markdown-row-text", "Markdown in antwoorden");
-  agentReplyMarkdownRow.append(agentReplyMarkdownCheckbox, agentReplyMarkdownText);
   const agentMemoryToolsRow = el("div", "mv-agent-memory-tools-row");
   const agentChatPromoteBtn = el("button", "mv-agent-chat-session-btn", "Promoveer chat");
   agentChatPromoteBtn.type = "button";
   agentChatPromoteBtn.title = "Verwerk de actieve chat naar long-term memory";
+  const agentChatSummarizeBtn = el("button", "mv-agent-chat-session-btn", "Samenvat chat");
+  agentChatSummarizeBtn.type = "button";
+  agentChatSummarizeBtn.title = "Compacteer de actieve chat tot een korte voortzettingssamenvatting om tokens te besparen";
   const agentChatPromoteStaleBtn = el("button", "mv-agent-chat-session-btn", "Verwerk stale");
   agentChatPromoteStaleBtn.type = "button";
   agentChatPromoteStaleBtn.title = "Promoveer chats die stale zijn naar long-term memory";
@@ -806,11 +850,12 @@ export async function bootstrap() {
   const agentSecondBrainBtn = el("button", "mv-agent-chat-session-btn", "Second brain");
   agentSecondBrainBtn.type = "button";
   agentSecondBrainBtn.title = "Toon metadata-, backlink- en mention-samenvatting van de second-brain index";
-  const agentAskToAgentBtn = el("button", "mv-agent-chat-session-btn", "Ask → Agent");
+  const agentAskToAgentBtn = el("button", "mv-agent-chat-session-btn", "Maak reviewvoorstel");
   agentAskToAgentBtn.type = "button";
   agentAskToAgentBtn.title =
-    "Gebruik het laatste Ask-antwoord als basis voor een Agent-instructie om het open document reviewbaar aan te passen";
+    "Gebruik het laatste antwoord als basis voor een reviewvoorstel in het open document";
   agentMemoryToolsRow.append(
+    agentChatSummarizeBtn,
     agentChatPromoteBtn,
     agentChatPromoteStaleBtn,
     agentMemoryToggleBtn,
@@ -820,22 +865,10 @@ export async function bootstrap() {
   );
   agentChatHead.append(
     agentChatTitleRow,
+    agentChatContextLine,
     agentChatSessionRow,
-    agentChatModes,
-    agentCorpusWideRow,
-    agentWebSearchRow,
-    agentReplyMarkdownRow,
     agentMemoryToolsRow,
   );
-
-  agentReplyMarkdownCheckbox.addEventListener("change", () => {
-    try {
-      localStorage.setItem(AGENT_REPLY_MARKDOWN_STORAGE_KEY, agentReplyMarkdownCheckbox.checked ? "1" : "0");
-    } catch {
-      /* */
-    }
-    rerenderAgentChatMessages();
-  });
 
   const agentSidebarBusy = el("div", "mv-agent-sidebar-busy");
   agentSidebarBusy.hidden = true;
@@ -847,12 +880,68 @@ export async function bootstrap() {
   const agentSidebarScroll = el("div", "mv-agent-sidebar-scroll");
   const agentMemoryPanel = el("div", "mv-agent-memory-panel");
   agentMemoryPanel.hidden = true;
-  const agentChatActivityStrip = el("div", "mv-agent-chat-activity");
-  agentChatActivityStrip.setAttribute("aria-live", "polite");
-  agentChatActivityStrip.setAttribute("aria-label", "Activiteit corpus-chat");
-  agentChatActivityStrip.hidden = true;
+  const emailAgentDialog = el("section", "mv-app-view mv-app-view--email mv-email-agent-dialog");
+  emailAgentDialog.hidden = true;
+  emailAgentDialog.setAttribute("role", "region");
+  emailAgentDialog.setAttribute("aria-label", "E-mailagent");
+  const emailAgentPanel = el("section", "mv-email-agent-panel");
+  emailAgentPanel.classList.add("mv-email-agent-card");
+  const emailAgentPanelHead = el("div", "mv-email-agent-panel-head");
+  const emailAgentPanelTitle = el("strong", "mv-email-agent-panel-title", "E-mailagent");
+  const emailAgentUnreadBadge = el("span", "mv-email-agent-badge", "0");
+  const emailAgentCloseBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Documenten");
+  emailAgentCloseBtn.type = "button";
+  emailAgentPanelHead.append(emailAgentPanelTitle, emailAgentUnreadBadge, emailAgentCloseBtn);
+  const emailAgentPanelStatus = el("div", "mv-email-agent-status", "Nog niet geladen.");
+  const emailAgentPanelActions = el("div", "mv-email-agent-actions");
+  const emailAgentRefreshBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Verversen");
+  emailAgentRefreshBtn.type = "button";
+  const emailAgentScanBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Scan nu");
+  emailAgentScanBtn.type = "button";
+  emailAgentPanelActions.append(emailAgentRefreshBtn, emailAgentScanBtn);
+  const emailAgentList = el("div", "mv-email-agent-list");
+  const emailAgentDetail = el("div", "mv-email-agent-detail");
+  emailAgentPanel.append(emailAgentPanelHead, emailAgentPanelStatus, emailAgentPanelActions, emailAgentList, emailAgentDetail);
+  emailAgentDialog.append(emailAgentPanel);
+
+  const kanbanDialog = el("section", "mv-app-view mv-app-view--kanban mv-kanban-dialog");
+  kanbanDialog.hidden = true;
+  kanbanDialog.setAttribute("role", "region");
+  kanbanDialog.setAttribute("aria-label", "Actie-Kanban");
+  const kanbanPanel = el("section", "mv-kanban-card");
+  const kanbanHead = el("div", "mv-kanban-head");
+  const kanbanTitle = el("strong", "mv-email-agent-panel-title", "Actie-Kanban");
+  const kanbanCloseBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Documenten");
+  kanbanCloseBtn.type = "button";
+  kanbanHead.append(kanbanTitle, kanbanCloseBtn);
+  const kanbanStatusText = el("div", "mv-email-agent-status", "Nog niet geladen.");
+  const kanbanActions = el("div", "mv-email-agent-actions");
+  const kanbanRefreshBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Verversen");
+  kanbanRefreshBtn.type = "button";
+  const kanbanNewBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Nieuwe taak");
+  kanbanNewBtn.type = "button";
+  const kanbanProjectFilterWrap = el("label", "mv-kanban-filter");
+  kanbanProjectFilterWrap.append(el("span", "mv-kanban-filter-label", "Project"));
+  const kanbanProjectFilterSelect = document.createElement("select");
+  kanbanProjectFilterSelect.className = "mv-kanban-filter-select";
+  kanbanProjectFilterSelect.setAttribute("aria-label", "Filter Kanban op project");
+  kanbanProjectFilterWrap.append(kanbanProjectFilterSelect);
+  kanbanActions.append(kanbanProjectFilterWrap, kanbanRefreshBtn, kanbanNewBtn);
+  const kanbanBoardShell = el("div", "mv-kanban-board-shell");
+  const kanbanBoardEl = el("div", "mv-kanban-board");
+  const kanbanDetailOverlay = el("div", "mv-kanban-detail-overlay");
+  kanbanDetailOverlay.hidden = true;
+  const kanbanDetail = el("div", "mv-kanban-detail");
+  kanbanDetailOverlay.append(kanbanDetail);
+  kanbanBoardShell.append(kanbanBoardEl, kanbanDetailOverlay);
+  kanbanPanel.append(kanbanHead, kanbanStatusText, kanbanActions, kanbanBoardShell);
+  kanbanDialog.append(kanbanPanel);
+  kanbanDetailOverlay.addEventListener("mousedown", (e) => {
+    if (e.target === kanbanDetailOverlay) closeKanbanDetailOverlay();
+  });
+  kanbanDetail.addEventListener("mousedown", (e) => e.stopPropagation());
   const agentChatMessages = el("div", "mv-agent-chat-messages");
-  agentSidebarScroll.append(agentMemoryPanel, agentChatActivityStrip, agentChatMessages);
+  agentSidebarScroll.append(agentMemoryPanel, agentChatMessages);
 
   function formatCorpusActivityLine(ev: CorpusActivityEvent): string {
     if (ev.phase === "read_file" && ev.path) {
@@ -898,6 +987,15 @@ export async function bootstrap() {
     if (ev.phase === "web_search") {
       return ev.detail ? `Internet zoeken: ${ev.detail}` : "Internet zoeken…";
     }
+    if (ev.phase === "model_switch" && ev.model) {
+      const role = ev.modelRole || ev.label || "model";
+      const reason = ev.modelReason ? ` — ${ev.modelReason}` : "";
+      return `Model (${role}): ${ev.model}${reason}`;
+    }
+    if (ev.model && ev.phase === "thinking") {
+      const base = ev.label || "Model denkt na…";
+      return `${base} [${ev.model}]`;
+    }
     if (ev.phase === "fetching") return ev.label || "Volledige bestanden ophalen…";
     if (ev.phase === "digest") return ev.label || "Gelezen inhoud verwerken…";
     if (ev.phase === "thinking") return ev.label || "Model denkt na…";
@@ -906,22 +1004,26 @@ export async function bootstrap() {
   }
 
   function clearAgentChatActivityStrip(): void {
-    agentChatActivityStrip.replaceChildren();
-    agentChatActivityStrip.hidden = true;
+    agentChatInlineActivities = [];
+    agentChatActivityAnchorIndex = null;
+  }
+
+  function beginAgentChatActivityStream(anchorIndex: number): void {
+    agentChatInlineActivities = [];
+    agentChatActivityAnchorIndex = anchorIndex;
   }
 
   function pushCorpusActivityRow(ev: CorpusActivityEvent): void {
-    agentChatActivityStrip.hidden = false;
     const line = formatCorpusActivityLine(ev);
-    const row = el("div", "mv-agent-chat-activity-row");
-    const dot = el("span", "mv-agent-chat-activity-dot");
-    const tx = el("span", "mv-agent-chat-activity-text", line);
-    row.append(dot, tx);
-    agentChatActivityStrip.append(row);
-    while (agentChatActivityStrip.childElementCount > 14) {
-      agentChatActivityStrip.removeChild(agentChatActivityStrip.firstChild!);
+    const isModel = ev.phase === "model_switch" || !!ev.model;
+    if (agentChatActivityAnchorIndex === null) {
+      agentChatActivityAnchorIndex = Math.max(0, agentChatHistory.length - 1);
     }
-    agentSidebarScroll.scrollTop = agentSidebarScroll.scrollHeight;
+    agentChatInlineActivities.push({ line, model: isModel });
+    while (agentChatInlineActivities.length > 80) {
+      agentChatInlineActivities.shift();
+    }
+    rerenderAgentChatMessages();
   }
 
   function formatMetricNumber(n: number | undefined): string {
@@ -953,18 +1055,18 @@ export async function bootstrap() {
     ].join(" · ");
   }
 
-  function pushPerformanceMetricsRow(metrics?: AgentPerformanceMetrics): void {
-    const line = formatAgentPerformanceMetrics(metrics);
-    if (!line) return;
-    agentChatActivityStrip.hidden = false;
-    const row = el("div", "mv-agent-chat-activity-row mv-agent-chat-activity-row--metrics");
-    const dot = el("span", "mv-agent-chat-activity-dot");
-    const tx = el("span", "mv-agent-chat-activity-text", `Metrics: ${line}`);
-    row.append(dot, tx);
-    agentChatActivityStrip.append(row);
-    while (agentChatActivityStrip.childElementCount > 14) {
-      agentChatActivityStrip.removeChild(agentChatActivityStrip.firstChild!);
+  function pushPerformanceMetricsRow(metrics?: AgentPerformanceMetrics, modelTrace?: ModelTraceEntry[]): void {
+    let line = formatAgentPerformanceMetrics(metrics);
+    if (!line && !modelTrace?.length) return;
+    if (modelTrace?.length) {
+      const trace = modelTrace.map((e) => `${e.phase}: ${e.model}`).join(" → ");
+      line = line ? `${line} · Modellen: ${trace}` : `Modellen: ${trace}`;
     }
+    if (agentChatActivityAnchorIndex === null) {
+      agentChatActivityAnchorIndex = Math.max(0, agentChatHistory.length - 1);
+    }
+    agentChatInlineActivities.push({ line: `Metrics: ${line}`, metrics: true });
+    rerenderAgentChatMessages();
   }
 
   const agentChatLlmDebug = el("div", "mv-agent-llm-debug");
@@ -1000,7 +1102,7 @@ export async function bootstrap() {
   const agentChatInput = document.createElement("textarea");
   agentChatInput.className = "mv-agent-chat-input";
   agentChatInput.rows = 3;
-  agentChatInput.placeholder = "Beschrijf wat de agent in het document moet aanpassen…";
+  agentChatInput.placeholder = "Vraag Nexus of geef een instructie voor het document…";
   const agentSpeechRecognitionAvailable = !!getSpeechRecognitionCtor();
   const agentChatMicBtn = el("button", "mv-agent-chat-mic mv-ribbon-btn mv-ribbon-btn--ghost");
   agentChatMicBtn.type = "button";
@@ -1013,18 +1115,41 @@ export async function bootstrap() {
     agentChatMicBtn.hidden = true;
   }
   agentChatInputWrap.append(agentChatInput, agentChatMicBtn);
+  let nexusExecuteOnActiveObject = false;
+  let pendingDocumentEditOffer: { userMessage: string; assistantIndex: number } | null = null;
+  const agentChatExecuteRow = el("div", "mv-agent-chat-execute-row");
+  const nexusExecuteOnActiveBtn = el(
+    "button",
+    "mv-agent-chat-execute-toggle mv-ribbon-btn mv-ribbon-btn--ghost",
+    "Acties op object",
+  );
+  nexusExecuteOnActiveBtn.type = "button";
+  nexusExecuteOnActiveBtn.setAttribute("aria-pressed", nexusExecuteOnActiveObject ? "true" : "false");
+  nexusExecuteOnActiveBtn.addEventListener("click", () => {
+    if (!nexusActiveObjectAvailable()) return;
+    nexusExecuteOnActiveObject = !nexusExecuteOnActiveObject;
+    refreshNexusExecuteOnActiveUi();
+    refreshAgentChatModeUi();
+  });
+  agentChatExecuteRow.append(nexusExecuteOnActiveBtn);
   const agentChatActions = el("div", "mv-agent-chat-actions");
   const meetingReportBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Gespreksverslag");
   meetingReportBtn.type = "button";
   meetingReportBtn.title =
-    "Plak een transcript en laat de Agent een gespreksverslag in het geopende document plaatsen.";
+    "Plak een transcript en laat Nexus een reviewvoorstel voor een gespreksverslag maken.";
   const promptMacroBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Macro");
   promptMacroBtn.type = "button";
   promptMacroBtn.title = "Kies, maak of beheer een herbruikbare promptmacro.";
+  const nexusReportIssueBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Meld probleem");
+  nexusReportIssueBtn.type = "button";
+  nexusReportIssueBtn.title = "Schrijf de huidige Nexus-context naar Files/.nexus-debug/errorlog.md.";
+  const nexusVerifyFixlogBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Fixlog testen");
+  nexusVerifyFixlogBtn.type = "button";
+  nexusVerifyFixlogBtn.title = "Laat Nexus de fixlog lezen, verificatie-instructies uitvoeren en bevindingen loggen.";
   const agentChatSendBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Verzend");
   agentChatSendBtn.type = "button";
-  agentChatActions.append(promptMacroBtn, meetingReportBtn, agentChatSendBtn);
-  agentChatComposer.append(agentChatInputWrap, agentChatActions);
+  agentChatActions.append(promptMacroBtn, meetingReportBtn, nexusReportIssueBtn, nexusVerifyFixlogBtn, agentChatSendBtn);
+  agentChatComposer.append(agentChatInputWrap, agentChatExecuteRow, agentChatActions);
 
   async function cleanupAgentChatSpeechTranscript(prefix: string, rawSpeech: string): Promise<void> {
     const rawTranscript = rawSpeech.trim();
@@ -1205,12 +1330,14 @@ export async function bootstrap() {
   };
   mobileMenuActions.append(
     makeMobileMenuButton("Openen…", () => browseFilesBtn.click()),
+    makeMobileMenuButton("Nieuw document", () => newDocBtn.click()),
     makeMobileMenuButton("Plakken", () => pasteMdBtn.click()),
     makeMobileMenuButton("Instellingen", () => settingsBtn.click()),
     makeMobileMenuButton("Word export", () => wordExportBtn.click()),
     makeMobileMenuButton("Word naar Markdown", () => docxImportBtn.click()),
     makeMobileMenuButton("Confluence importeren", () => confluenceImportBtn.click()),
     makeMobileMenuButton("Zoek Confluence", () => confluenceSearchBtn.click()),
+    makeMobileMenuButton("E-mailagent", () => emailAgentBtn.click()),
     makeMobileMenuButton("Afdrukken", () => printBtn.click()),
     makeMobileMenuButton("Opslaan", () => saveDocBtn.click()),
     makeMobileMenuButton("Herstellen", () => discardBtn.click()),
@@ -1218,9 +1345,9 @@ export async function bootstrap() {
   );
   mobileMenu.append(mobileMenuHead, mobileMenuActions);
 
-  const mobileChatLauncher = el("button", "mv-mobile-chat-launcher", "Agent");
+  const mobileChatLauncher = el("button", "mv-mobile-chat-launcher", "Nexus");
   mobileChatLauncher.type = "button";
-  mobileChatLauncher.setAttribute("aria-label", "Agent-chat openen");
+  mobileChatLauncher.setAttribute("aria-label", "Nexus-chat openen");
 
   const fileTreePanel = el("aside", "mv-file-tree");
   fileTreePanel.setAttribute("aria-label", "Markdown-bestanden");
@@ -1233,12 +1360,14 @@ export async function bootstrap() {
   const fileTreeFilter = document.createElement("input");
   fileTreeFilter.type = "search";
   fileTreeFilter.className = "mv-file-tree-filter";
-  fileTreeFilter.placeholder = "Filter…";
-  fileTreeFilter.setAttribute("aria-label", "Filter bestandslijst");
+  fileTreeFilter.placeholder = "Zoek document… (Ctrl+K)";
+  fileTreeFilter.setAttribute("aria-label", "Zoek of filter bestanden");
   fileTreeTitleRow.append(fileTreeTitle, fileTreeCloseBtn);
   fileTreeHead.append(fileTreeTitleRow, fileTreeFilter);
+  const corpusSearchPanel = el("div", "mv-corpus-search-panel");
+  corpusSearchPanel.hidden = true;
   const fileTreeScroll = el("div", "mv-file-tree-scroll");
-  fileTreePanel.append(fileTreeHead, fileTreeScroll);
+  fileTreePanel.append(fileTreeHead, corpusSearchPanel, fileTreeScroll);
 
   const treePaneResizer = el("div", "mv-body-pane-resizer mv-body-pane-resizer--tree");
   treePaneResizer.setAttribute("role", "separator");
@@ -1254,14 +1383,160 @@ export async function bootstrap() {
   agentPaneResizer.setAttribute("aria-orientation", "vertical");
   agentPaneResizer.setAttribute(
     "aria-label",
-    "Sleep om de breedte van het Agent-paneel en het document aan te passen",
+    "Sleep om de breedte van het Nexus-paneel en het document aan te passen",
   );
   agentPaneResizer.tabIndex = 0;
 
-  bodyWrap.append(fileTreePanel, treePaneResizer, main, agentPaneResizer, agentChatPanel);
+  const mainAppNav = el("nav", "mv-main-app-nav");
+  mainAppNav.setAttribute("aria-label", "Hoofdweergaves");
+  const documentViewBtn = el("button", "mv-main-app-tab mv-main-app-tab--active", "Documenten");
+  documentViewBtn.type = "button";
+  const emailViewBtn = el("button", "mv-main-app-tab", "E-mailagent");
+  emailViewBtn.type = "button";
+  const kanbanViewBtn = el("button", "mv-main-app-tab", "Kanban");
+  kanbanViewBtn.type = "button";
+  mainAppNav.append(documentViewBtn, emailViewBtn, kanbanViewBtn);
 
-  shell.append(toolbar, ribbon, bodyWrap, mobileBackdrop, mobileMenu, mobileChatLauncher);
+  const mainAppWorkspace = el("div", "mv-main-app-workspace");
+  const mainAppHost = el("div", "mv-main-app-host");
+  const documentAppView = el("section", "mv-app-view mv-app-view--documents");
+  documentAppView.setAttribute("role", "region");
+  documentAppView.setAttribute("aria-label", "Document viewer en editor");
+  bodyWrap.append(fileTreePanel, treePaneResizer, main);
+  documentAppView.append(bodyWrap);
+  mainAppHost.append(documentAppView, emailAgentDialog, kanbanDialog);
+  mainAppWorkspace.append(mainAppHost, agentPaneResizer, agentChatPanel);
+
+  shell.append(toolbar, mainAppNav, ribbon, mainAppWorkspace, mobileBackdrop, mobileMenu, mobileChatLauncher);
   app.append(shell);
+
+  let activeMainAppView: MainAppView = "documents";
+
+  function nexusActiveObjectAvailable(): boolean {
+    if (activeMainAppView === "documents") return !!fileSelect.value.trim();
+    if (activeMainAppView === "email") return !!emailAgentSelectedNotificationId;
+    if (activeMainAppView === "kanban") return !!kanbanSelectedTaskId;
+    return false;
+  }
+
+  function nexusExecuteOnActiveLabel(): string {
+    if (activeMainAppView === "email") return "Acties op e-mail";
+    if (activeMainAppView === "kanban") return "Acties op taak";
+    if (activeMainAppView === "documents" && fileSelect.value.trim()) return "Wijzig document";
+    return "Acties op object";
+  }
+
+  function resetNexusExecuteOnActive(): void {
+    if (!nexusExecuteOnActiveObject) return;
+    nexusExecuteOnActiveObject = false;
+    refreshAgentChatModeUi();
+  }
+
+  function clearPendingDocumentEditOffer(): void {
+    pendingDocumentEditOffer = null;
+  }
+
+  function highlightNexusExecuteOnActiveBtn(): void {
+    if (!nexusActiveObjectAvailable()) return;
+    nexusExecuteOnActiveBtn.classList.add("mv-agent-chat-execute-toggle--hint");
+    window.setTimeout(() => {
+      nexusExecuteOnActiveBtn.classList.remove("mv-agent-chat-execute-toggle--hint");
+    }, 4500);
+  }
+
+  function maybeSetPendingDocumentEditOffer(userMessage: string, assistantReply: string, mode: AgentChatMode, executeOnActive: boolean): void {
+    if (
+      mode !== "ask" ||
+      executeOnActive ||
+      activeMainAppView !== "documents" ||
+      !getAgentChatDocumentName() ||
+      !shouldOfferDocumentEditMode(
+        userMessage,
+        { activeView: activeMainAppView, hasDocument: true },
+        assistantReply,
+        { executeOnActive },
+      )
+    ) {
+      return;
+    }
+    const assistantIndex = agentChatHistory.length - 1;
+    if (assistantIndex < 0 || agentChatHistory[assistantIndex]?.role !== "assistant") return;
+    pendingDocumentEditOffer = { userMessage, assistantIndex };
+  }
+
+  function createDocumentEditOfferBlock(userMessage: string): HTMLElement {
+    const decision = el("div", "mv-agent-chat-msg-decision mv-agent-chat-msg-decision--doc-offer");
+    const hint = el(
+      "span",
+      "mv-agent-chat-msg-decision-hint",
+      "Dit lijkt een documentopdracht. Zet Wijzig document aan om een reviewvoorstel in het open bestand te maken.",
+    );
+    const row = el("div", "mv-agent-chat-msg-decision-row");
+    const offerBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Wijzig document");
+    offerBtn.type = "button";
+    offerBtn.disabled = agentChatRequestBusy;
+    offerBtn.title = "Schakel documentmodus in en voer deze opdracht opnieuw uit.";
+    offerBtn.addEventListener("click", () => void executePendingDocumentEditOffer(userMessage));
+    row.append(offerBtn);
+    decision.append(hint, row);
+    return decision;
+  }
+
+  async function executePendingDocumentEditOffer(userMessage: string): Promise<void> {
+    if (agentChatRequestBusy || sidebarReviewBusy) return;
+    if (!getAgentChatDocumentName()) {
+      status.textContent = "Open eerst een document om Wijzig document te gebruiken.";
+      return;
+    }
+    clearPendingDocumentEditOffer();
+    while (agentChatHistory.length && agentChatHistory[agentChatHistory.length - 1]?.role === "assistant") {
+      agentChatHistory.pop();
+    }
+    if (agentChatHistory.length && agentChatHistory[agentChatHistory.length - 1]?.role === "user") {
+      agentChatHistory.pop();
+    }
+    nexusExecuteOnActiveObject = true;
+    refreshNexusExecuteOnActiveUi();
+    refreshAgentChatModeUi();
+    agentChatInput.value = userMessage;
+    rerenderAgentChatMessages();
+    await submitAgentChat();
+  }
+
+  function refreshNexusExecuteOnActiveUi(): void {
+    const available = nexusActiveObjectAvailable();
+    agentChatExecuteRow.hidden = !available;
+    nexusExecuteOnActiveBtn.hidden = !available;
+    nexusExecuteOnActiveBtn.textContent = nexusExecuteOnActiveLabel();
+    nexusExecuteOnActiveBtn.classList.toggle(
+      "mv-agent-chat-execute-toggle--active",
+      nexusExecuteOnActiveObject && available,
+    );
+    nexusExecuteOnActiveBtn.setAttribute(
+      "aria-pressed",
+      nexusExecuteOnActiveObject && available ? "true" : "false",
+    );
+    nexusExecuteOnActiveBtn.title = available
+      ? nexusExecuteOnActiveObject
+        ? "Uitvoermodus aan: Nexus voert concrete acties uit op het open object."
+        : "Uitvoermodus uit: Nexus adviseert vooral zonder directe acties."
+      : "Open eerst een document, e-mail of Kanban-taak.";
+  }
+
+  function setMainAppView(view: MainAppView): void {
+    activeMainAppView = view;
+    documentAppView.hidden = view !== "documents";
+    emailAgentDialog.hidden = view !== "email";
+    kanbanDialog.hidden = view !== "kanban";
+    ribbon.hidden = view !== "documents" || !fileSelect.value;
+    documentViewBtn.classList.toggle("mv-main-app-tab--active", view === "documents");
+    emailViewBtn.classList.toggle("mv-main-app-tab--active", view === "email");
+    kanbanViewBtn.classList.toggle("mv-main-app-tab--active", view === "kanban");
+    documentViewBtn.setAttribute("aria-current", view === "documents" ? "page" : "false");
+    emailViewBtn.setAttribute("aria-current", view === "email" ? "page" : "false");
+    kanbanViewBtn.setAttribute("aria-current", view === "kanban" ? "page" : "false");
+    refreshNexusExecuteOnActiveUi();
+  }
 
   const AGENT_PANE_WIDTH_STORAGE_KEY = "mv.agentPaneWidthPx";
   const TREE_PANE_WIDTH_STORAGE_KEY = "mv.treePaneWidthPx";
@@ -1348,27 +1623,25 @@ export async function bootstrap() {
   function maxAgentPaneWidthPx(): number {
     return Math.max(
       AGENT_PANE_MIN_PX,
-      bodyWrap.clientWidth -
-        treePaneWidthPx -
+      mainAppWorkspace.clientWidth -
         AGENT_PANE_DOC_MIN_PX -
-        2 * BODY_PANE_RESIZER_WIDTH,
+        BODY_PANE_RESIZER_WIDTH,
     );
   }
 
   function maxTreePaneWidthPx(): number {
     return Math.max(
       TREE_PANE_MIN_PX,
-      bodyWrap.clientWidth -
-        agentPaneWidthPx -
+      mainAppHost.clientWidth -
         AGENT_PANE_DOC_MIN_PX -
-        2 * BODY_PANE_RESIZER_WIDTH,
+        BODY_PANE_RESIZER_WIDTH,
     );
   }
 
   function applyAgentPaneWidth(px: number, persistToStorage: boolean): void {
     const max = maxAgentPaneWidthPx();
     agentPaneWidthPx = Math.min(max, Math.max(AGENT_PANE_MIN_PX, Math.round(px)));
-    bodyWrap.style.setProperty("--mv-agent-pane-width", `${agentPaneWidthPx}px`);
+    mainAppWorkspace.style.setProperty("--mv-agent-pane-width", `${agentPaneWidthPx}px`);
     if (persistToStorage) {
       try {
         localStorage.setItem(AGENT_PANE_WIDTH_STORAGE_KEY, String(agentPaneWidthPx));
@@ -1602,7 +1875,7 @@ export async function bootstrap() {
   const meetingReportHint = el(
     "div",
     "mv-md-dialog-hint",
-    "Plak hieronder het transcript. Na bevestigen stuurt de Agent een opdracht om het gespreksverslag in het geopende document te plaatsen.",
+    "Plak hieronder het transcript. Na bevestigen maakt Nexus een reviewvoorstel voor het geopende document.",
   );
   const meetingReportTranscriptLabel = el("label", "mv-md-dialog-label", "Transcript");
   meetingReportTranscriptLabel.setAttribute("for", "mv-meeting-report-transcript");
@@ -1636,7 +1909,7 @@ export async function bootstrap() {
   const promptMacroHint = el(
     "div",
     "mv-md-dialog-hint",
-    "Maak herbruikbare opdrachten voor Agent of Ask. Een macro bestaat uit een vaste prompt en kan optioneel aanvullende inhoud vragen, zoals een transcript.",
+    "Maak herbruikbare Nexus-opdrachten. Een macro bestaat uit een vaste prompt en kan optioneel aanvullende inhoud vragen, zoals een transcript.",
   );
   const promptMacroSelectLabel = el("label", "mv-md-dialog-label", "Macro");
   promptMacroSelectLabel.setAttribute("for", "mv-prompt-macro-select");
@@ -1669,8 +1942,8 @@ export async function bootstrap() {
   promptMacroMode.id = "mv-prompt-macro-mode";
   promptMacroMode.className = "mv-md-dialog-input";
   for (const [value, label] of [
-    ["agent", "Agent - past het document aan"],
-    ["ask", "Ask - beantwoordt alleen in chat"],
+    ["agent", "Reviewvoorstel voor document"],
+    ["ask", "Antwoord of actie zonder documentwijziging"],
   ] as const) {
     const opt = document.createElement("option");
     opt.value = value;
@@ -1732,8 +2005,6 @@ export async function bootstrap() {
     promptMacroName,
     promptMacroDescriptionLabel,
     promptMacroDescription,
-    promptMacroModeLabel,
-    promptMacroMode,
     promptMacroRequiresContentLabel,
     promptMacroContentLabelLabel,
     promptMacroContentLabel,
@@ -1769,11 +2040,15 @@ export async function bootstrap() {
   confluenceImportInput.type = "text";
   confluenceImportInput.placeholder = "https://confluence.../display/SPACE/Page+Title of 123456";
   const confluenceImportActions = el("div", "mv-md-dialog-actions");
+  const confluenceImportSyncBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Browser-sessie");
+  confluenceImportSyncBtn.type = "button";
+  confluenceImportSyncBtn.title =
+    "Start desnoods PoC-Edge (poort 9224) en haal daarna de Confluence SSO-cookies op.";
   const confluenceImportCancelBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Annuleren");
   confluenceImportCancelBtn.type = "button";
   const confluenceImportRunBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Importeren");
   confluenceImportRunBtn.type = "button";
-  confluenceImportActions.append(confluenceImportCancelBtn, confluenceImportRunBtn);
+  confluenceImportActions.append(confluenceImportSyncBtn, confluenceImportCancelBtn, confluenceImportRunBtn);
   confluenceImportCard.append(
     confluenceImportTitle,
     confluenceImportHint,
@@ -1891,6 +2166,84 @@ export async function bootstrap() {
     agentDebugLlmLabel,
     agentConfigHint,
   );
+  const agentModelCatalogHost = el("div", "mv-agent-model-catalog");
+  agentModelCatalogHost.hidden = true;
+  const agentModelCatalogTitle = el("div", "mv-md-dialog-label", "Modelcatalogus (Auto-router)");
+  const agentModelCatalogPre = el("pre", "mv-agent-model-catalog-pre");
+  agentModelCatalogPre.textContent = "Laad catalogus wanneer Auto is gekozen…";
+  const agentModelRouterStatsBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--table", "Router-statistieken");
+  agentModelRouterStatsBtn.type = "button";
+  agentModelRouterStatsBtn.hidden = true;
+  agentModelCatalogHost.append(agentModelCatalogTitle, agentModelCatalogPre, agentModelRouterStatsBtn);
+  settingsSectionAgent.append(agentModelCatalogHost);
+  agentModel.addEventListener("change", () => void refreshAgentModelCatalogPanel());
+  const settingsSectionEmailAgent = el("div", "mv-settings-section");
+  const emailAgentEnabledCb = document.createElement("input");
+  emailAgentEnabledCb.type = "checkbox";
+  emailAgentEnabledCb.id = "mv-email-agent-enabled";
+  const emailAgentEnabledLabel = el("label", "mv-md-dialog-label mv-email-agent-check");
+  emailAgentEnabledLabel.htmlFor = "mv-email-agent-enabled";
+  emailAgentEnabledLabel.append(emailAgentEnabledCb, document.createTextNode(" E-mailagent periodiek laten scannen"));
+  const emailAgentIntervalInput = document.createElement("input");
+  emailAgentIntervalInput.className = "mv-md-dialog-input";
+  emailAgentIntervalInput.type = "number";
+  emailAgentIntervalInput.min = "5";
+  emailAgentIntervalInput.max = "120";
+  emailAgentIntervalInput.step = "5";
+  const emailAgentWindowInput = document.createElement("input");
+  emailAgentWindowInput.className = "mv-md-dialog-input";
+  emailAgentWindowInput.type = "number";
+  emailAgentWindowInput.min = "1";
+  emailAgentWindowInput.max = "168";
+  emailAgentWindowInput.step = "1";
+  emailAgentWindowInput.disabled = true;
+  const emailAgentMaxInput = document.createElement("input");
+  emailAgentMaxInput.className = "mv-md-dialog-input";
+  emailAgentMaxInput.type = "number";
+  emailAgentMaxInput.min = "1";
+  emailAgentMaxInput.max = "25";
+  emailAgentMaxInput.step = "1";
+  const emailAgentInboxCb = document.createElement("input");
+  emailAgentInboxCb.type = "checkbox";
+  emailAgentInboxCb.id = "mv-email-agent-inbox";
+  emailAgentInboxCb.checked = true;
+  emailAgentInboxCb.disabled = true;
+  const emailAgentFoldersRow = el("div", "mv-email-agent-settings-row");
+  const emailAgentInboxLabel = el("label", "mv-md-dialog-label mv-email-agent-check");
+  emailAgentInboxLabel.htmlFor = "mv-email-agent-inbox";
+  emailAgentInboxLabel.append(emailAgentInboxCb, document.createTextNode(" Actielijst: alleen inbox; geheugen: inbox + verzonden relevant"));
+  emailAgentFoldersRow.append(emailAgentInboxLabel);
+  const emailAgentLlmCb = document.createElement("input");
+  emailAgentLlmCb.type = "checkbox";
+  emailAgentLlmCb.id = "mv-email-agent-llm";
+  const emailAgentLlmLabel = el("label", "mv-md-dialog-label mv-email-agent-check");
+  emailAgentLlmLabel.htmlFor = "mv-email-agent-llm";
+  emailAgentLlmLabel.append(emailAgentLlmCb, document.createTextNode(" LLM gebruiken voor relevantie en extractie"));
+  const emailAgentSettingsStatus = el("div", "mv-md-dialog-hint", "E-mailagentstatus nog niet geladen.");
+  const emailAgentSettingsToolbar = el("div", "mv-settings-log-toolbar");
+  const emailAgentSettingsSaveBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "E-mailagent opslaan");
+  emailAgentSettingsSaveBtn.type = "button";
+  const emailAgentSettingsScanBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Handmatige scan");
+  emailAgentSettingsScanBtn.type = "button";
+  const emailAgentNotifyBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Browsermeldingen toestaan");
+  emailAgentNotifyBtn.type = "button";
+  emailAgentSettingsToolbar.append(emailAgentSettingsSaveBtn, emailAgentSettingsScanBtn, emailAgentNotifyBtn);
+  settingsSectionEmailAgent.append(
+    el("h3", "mv-settings-section-title", "E-mailagent"),
+    emailAgentSettingsStatus,
+    emailAgentEnabledLabel,
+    el("label", "mv-md-dialog-label", "Scaninterval in minuten (5-120)"),
+    emailAgentIntervalInput,
+    el("label", "mv-md-dialog-label", "Scanrange"),
+    emailAgentWindowInput,
+    el("div", "mv-md-dialog-hint", "Tijdelijk vastgezet: gewone scans pakken alleen vandaag, van 00:00 lokale tijd tot nu."),
+    el("label", "mv-md-dialog-label", "Maximaal aantal e-mails per map per run"),
+    emailAgentMaxInput,
+    el("label", "mv-md-dialog-label", "Mappen"),
+    emailAgentFoldersRow,
+    emailAgentLlmLabel,
+    emailAgentSettingsToolbar,
+  );
   const settingsSectionInstructions = el("div", "mv-settings-section");
   const agentInstructionsHint = el(
     "div",
@@ -1902,7 +2255,7 @@ export async function bootstrap() {
   agentInstructionsText.className = "mv-md-dialog-textarea";
   agentInstructionsText.rows = 12;
   agentInstructionsText.spellcheck = false;
-  agentInstructionsText.setAttribute("aria-label", "Agent-instructies Markdown");
+  agentInstructionsText.setAttribute("aria-label", "Nexus-instructies Markdown");
   const agentInstructionsToolbar = el("div", "mv-settings-log-toolbar");
   const agentInstructionsRefreshBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Verversen");
   agentInstructionsRefreshBtn.type = "button";
@@ -1910,7 +2263,7 @@ export async function bootstrap() {
   agentInstructionsSaveBtn.type = "button";
   agentInstructionsToolbar.append(agentInstructionsRefreshBtn, agentInstructionsSaveBtn);
   settingsSectionInstructions.append(
-    el("h3", "mv-settings-section-title", "Agent-instructies"),
+    el("h3", "mv-settings-section-title", "Nexus-instructies"),
     agentInstructionsHint,
     agentInstructionsPath,
     agentInstructionsText,
@@ -1949,6 +2302,7 @@ export async function bootstrap() {
   settingsScroll.append(
     settingsSectionTpl,
     settingsSectionAgent,
+    settingsSectionEmailAgent,
     settingsSectionInstructions,
     settingsSectionLogs,
   );
@@ -2259,6 +2613,7 @@ ${transcript}`;
       return;
     }
     hideMeetingReportDialog();
+    pendingPromptMacroRun = { id: "meeting-report", mode: "agent" };
     agentChatMode = "agent";
     refreshAgentChatModeUi();
     agentChatInput.value = buildMeetingReportPrompt(transcript);
@@ -2326,6 +2681,7 @@ ${transcript}`;
   }
 
   function promptMacroFormPayload(): Partial<PromptMacro> {
+    const current = selectedPromptMacro();
     return {
       name: promptMacroName.value.trim(),
       description: promptMacroDescription.value.trim(),
@@ -2333,16 +2689,33 @@ ${transcript}`;
       prompt: promptMacroPrompt.value.trim(),
       requiresContent: promptMacroRequiresContent.checked,
       contentLabel: promptMacroContentLabel.value.trim() || "Aanvullende inhoud",
-      contentPlaceholder: promptMacroRunContent.placeholder.trim(),
+      contentPlaceholder:
+        promptMacroRunContent.placeholder.trim() || current?.contentPlaceholder || "",
       contentPrefix: promptMacroContentPrefix.value.trim() || "Aanvullende inhoud:",
     };
   }
 
-  async function savePromptMacroFromForm(): Promise<void> {
+  function effectivePromptMacroFromForm(base: PromptMacro | null): PromptMacro | null {
+    if (!base) return null;
+    const payload = promptMacroFormPayload();
+    return {
+      ...base,
+      name: payload.name || base.name,
+      description: payload.description ?? base.description,
+      mode: payload.mode === "ask" ? "ask" : "agent",
+      prompt: payload.prompt || base.prompt,
+      requiresContent: payload.requiresContent === true,
+      contentLabel: payload.contentLabel || base.contentLabel,
+      contentPlaceholder: payload.contentPlaceholder || base.contentPlaceholder,
+      contentPrefix: payload.contentPrefix || base.contentPrefix,
+    };
+  }
+
+  async function savePromptMacroFromForm(): Promise<PromptMacro | null> {
     const payload = promptMacroFormPayload();
     if (!payload.name || !payload.prompt) {
       status.textContent = "Macro opslaan mislukt: naam en vaste prompt zijn verplicht.";
-      return;
+      return null;
     }
     promptMacroSaveBtn.disabled = true;
     try {
@@ -2350,12 +2723,19 @@ ${transcript}`;
         ? await updatePromptMacro(promptMacroEditingId, payload)
         : await createPromptMacro(payload);
       promptMacros = result.macros;
-      const nextId = promptMacroEditingId || promptMacros.at(-1)?.id || "";
-      renderPromptMacroOptions(nextId);
+      const savedId =
+        promptMacroEditingId ||
+        result.macros.find((m) => m.name === payload.name && m.prompt === payload.prompt)?.id ||
+        result.macros.at(-1)?.id ||
+        "";
+      promptMacroEditingId = savedId;
+      renderPromptMacroOptions(savedId);
       fillPromptMacroForm(selectedPromptMacro());
       status.textContent = "Promptmacro opgeslagen.";
+      return selectedPromptMacro();
     } catch (e) {
       status.textContent = `Promptmacro opslaan mislukt: ${String((e as Error).message)}`;
+      return null;
     } finally {
       promptMacroSaveBtn.disabled = false;
     }
@@ -2393,16 +2773,25 @@ ${transcript}`;
       status.textContent = "Kies eerst een promptmacro.";
       return;
     }
+    const effectiveMacro = effectivePromptMacroFromForm(macro);
+    if (!effectiveMacro?.prompt.trim()) {
+      status.textContent = "Vaste prompt is leeg.";
+      promptMacroPrompt.focus();
+      return;
+    }
     const content = promptMacroRunContent.value.trim();
-    if (macro.requiresContent && !content) {
-      status.textContent = `Vul eerst ${macro.contentLabel || "aanvullende inhoud"} in.`;
+    if (effectiveMacro.requiresContent && !content) {
+      status.textContent = `Vul eerst ${effectiveMacro.contentLabel || "aanvullende inhoud"} in.`;
       promptMacroRunContent.focus();
       return;
     }
+    const saved = await savePromptMacroFromForm();
+    if (!saved) return;
     hidePromptMacroDialog();
-    agentChatMode = macro.mode;
+    pendingPromptMacroRun = { id: saved.id, mode: saved.mode };
+    agentChatMode = saved.mode;
     refreshAgentChatModeUi();
-    agentChatInput.value = buildPromptMacroMessage(macro, content);
+    agentChatInput.value = buildPromptMacroMessage(saved, content);
     await submitAgentChat();
   }
 
@@ -2448,13 +2837,1428 @@ ${transcript}`;
     }
   }
 
+  let emailAgentKnownNotificationIds = new Set<string>();
+  let emailAgentNotifications: EmailAgentNotification[] = [];
+  let emailAgentSelectedNotificationId = "";
+  const emailAgentFullMailCache = new Map<string, OutlookMailReadItem>();
+  let kanbanBoardState: KanbanBoardPayload = { ok: true, columns: [], tasks: [], total: 0 };
+  let kanbanProjectCatalog: string[] = [];
+  let kanbanSelectedTaskId = "";
+  let kanbanDetailOverlayOpen = false;
+  let kanbanDraggedTaskId = "";
+  let kanbanProjectFilter = "";
+  let kanbanRefreshBusy = false;
+  let kanbanDetailComments: KanbanCommentThread[] = [];
+  let kanbanDetailCommentsTaskId = "";
+  const KANBAN_AUTO_REFRESH_MS = 60000;
+
+  const KANBAN_STATUS_LABELS: Record<KanbanStatus, string> = {
+    inbox: "Inbox",
+    today: "Vandaag",
+    this_week: "Deze week",
+    waiting: "Wachten op",
+    scheduled: "Gepland",
+    doing: "In uitvoering",
+    done: "Afgehandeld",
+    ignored: "Genegeerd",
+  };
+  const KANBAN_COLUMN_COMPACT_THRESHOLD = 8;
+  const KANBAN_TERMINAL_COMPACT_THRESHOLD = 4;
+  const KANBAN_TERMINAL_STATUSES = new Set<KanbanStatus>(["done", "ignored"]);
+
+  function kanbanColumnUsesCompactLayout(status: KanbanStatus, taskCount: number): boolean {
+    if (taskCount >= KANBAN_COLUMN_COMPACT_THRESHOLD) return true;
+    return KANBAN_TERMINAL_STATUSES.has(status) && taskCount >= KANBAN_TERMINAL_COMPACT_THRESHOLD;
+  }
+
+  function kanbanTaskById(id: string): KanbanTask | null {
+    return kanbanBoardState.tasks.find((task) => task.id === id) || null;
+  }
+
+  function kanbanTaskCardTooltip(task: KanbanTask): string {
+    const parts = [task.title];
+    if (task.project.trim()) parts.push(`Project: ${task.project.trim()}`);
+    if (task.nextAction.trim()) parts.push(`Next: ${task.nextAction.trim()}`);
+    if (task.dueDate) parts.push(`Deadline: ${task.dueDate}`);
+    parts.push("Dubbelklik om te openen");
+    return parts.join("\n");
+  }
+
+  function kanbanTaskCardSignature(task: KanbanTask): string {
+    return [
+      task.id,
+      task.title,
+      task.status,
+      task.priority,
+      task.project,
+      task.dueDate,
+      task.nextAction,
+      String(task.rank),
+      task.id === kanbanSelectedTaskId ? "sel" : "",
+    ].join("\0");
+  }
+
+  function buildKanbanTaskCard(task: KanbanTask): HTMLButtonElement {
+    const btn = el("button", `mv-kanban-task mv-kanban-task--${task.priority}`);
+    btn.type = "button";
+    btn.draggable = true;
+    btn.dataset.taskId = task.id;
+    btn.dataset.kanbanSig = kanbanTaskCardSignature(task);
+    btn.title = kanbanTaskCardTooltip(task);
+    if (task.id === kanbanSelectedTaskId) btn.classList.add("is-selected");
+    applyProjectColorToElement(btn, task.project);
+    const titleRow = el("div", "mv-kanban-task-title-row");
+    titleRow.append(el("span", "mv-kanban-task-title", task.title));
+    if (task.priority === "hoog" || task.priority === "kritiek") {
+      titleRow.append(el("span", `mv-kanban-task-priority mv-kanban-task-priority--${task.priority}`, task.priority));
+    }
+    btn.append(titleRow);
+    if (task.project.trim()) {
+      const projectChip = el("span", "mv-kanban-task-project", task.project.trim());
+      applyProjectColorToElement(projectChip, task.project);
+      btn.append(projectChip);
+    }
+    const metaParts = [task.priority, task.dueDate ? `deadline ${task.dueDate}` : ""].filter(Boolean);
+    if (metaParts.length) btn.append(el("span", "mv-kanban-task-meta", metaParts.join(" · ")));
+    if (task.nextAction.trim()) btn.append(el("span", "mv-kanban-task-action", task.nextAction.trim()));
+    btn.addEventListener("dragstart", (e) => {
+      kanbanDraggedTaskId = task.id;
+      btn.classList.add("is-dragging");
+      e.dataTransfer?.setData("text/plain", task.id);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    });
+    btn.addEventListener("dragend", () => {
+      kanbanDraggedTaskId = "";
+      kanbanBoardEl.querySelectorAll(".is-drag-over, .is-dragging").forEach((node) => {
+        node.classList.remove("is-drag-over", "is-dragging");
+      });
+    });
+    btn.addEventListener("click", () => selectKanbanTask(task.id));
+    btn.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      const latest = kanbanTaskById(task.id);
+      if (latest) openKanbanDetailOverlay(latest);
+    });
+    return btn;
+  }
+
+  function updateKanbanTaskCard(btn: HTMLButtonElement, task: KanbanTask, laneList?: HTMLElement): HTMLButtonElement {
+    const sig = kanbanTaskCardSignature(task);
+    const inCorrectLane = !laneList || btn.parentElement === laneList;
+    if (btn.dataset.kanbanSig === sig && inCorrectLane) {
+      btn.classList.toggle("is-selected", task.id === kanbanSelectedTaskId);
+      return btn;
+    }
+    const next = buildKanbanTaskCard(task);
+    btn.replaceWith(next);
+    return next;
+  }
+
+  function syncKanbanTaskSelection(): void {
+    kanbanBoardEl.querySelectorAll<HTMLElement>(".mv-kanban-task[data-task-id]").forEach((btn) => {
+      const selected = btn.dataset.taskId === kanbanSelectedTaskId;
+      btn.classList.toggle("is-selected", selected);
+      const sig = btn.dataset.kanbanSig || "";
+      if (sig) {
+        const parts = sig.split("\0");
+        if (parts.length >= 9) {
+          parts[8] = selected ? "sel" : "";
+          btn.dataset.kanbanSig = parts.join("\0");
+        }
+      }
+    });
+  }
+
+  function captureKanbanBoardScroll(): Map<string, number> {
+    const scrollByStatus = new Map<string, number>();
+    kanbanBoardEl.querySelectorAll<HTMLElement>(".mv-kanban-column-list").forEach((list) => {
+      if (list.dataset.status) scrollByStatus.set(list.dataset.status, list.scrollTop);
+    });
+    return scrollByStatus;
+  }
+
+  function syncKanbanBoardStatusText(): void {
+    const visibleTasks = kanbanVisibleTasks();
+    kanbanStatusText.textContent =
+      `${visibleTasks.length} van ${kanbanBoardState.tasks.length} taak/taken` +
+      (kanbanProjectFilter ? ` · project: ${kanbanProjectFilter}` : "") +
+      ` · ${kanbanBoardState.tasksPath || "Files/.kanban/tasks.json"}`;
+  }
+
+  function pulseKanbanBoardSynced(): void {
+    kanbanBoardEl.classList.add("mv-kanban-board--synced");
+    window.setTimeout(() => kanbanBoardEl.classList.remove("mv-kanban-board--synced"), 900);
+  }
+
+  function syncKanbanColumnList(list: HTMLElement, tasks: KanbanTask[]): void {
+    const desiredIds = new Set(tasks.map((task) => task.id));
+    list.querySelectorAll<HTMLElement>(".mv-kanban-task[data-task-id]").forEach((btn) => {
+      if (!desiredIds.has(btn.dataset.taskId || "")) btn.remove();
+    });
+    if (!tasks.length) {
+      if (!list.querySelector(".mv-kanban-task") && !list.querySelector(".mv-kanban-empty")) {
+        list.append(el("div", "mv-kanban-empty", "Geen taken."));
+      }
+      return;
+    }
+    list.querySelector(".mv-kanban-empty")?.remove();
+    const cardById = new Map<string, HTMLButtonElement>();
+    kanbanBoardEl.querySelectorAll<HTMLButtonElement>(".mv-kanban-task[data-task-id]").forEach((btn) => {
+      if (btn.dataset.taskId) cardById.set(btn.dataset.taskId, btn);
+    });
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
+      let btn = cardById.get(task.id);
+      if (!btn) {
+        btn = buildKanbanTaskCard(task);
+        cardById.set(task.id, btn);
+      } else {
+        btn = updateKanbanTaskCard(btn, task, list);
+        cardById.set(task.id, btn);
+      }
+      const nextRef = i + 1 < tasks.length ? cardById.get(tasks[i + 1].id) ?? null : null;
+      if (btn.parentElement !== list) list.insertBefore(btn, nextRef);
+      else if (btn.nextElementSibling !== nextRef) list.insertBefore(btn, nextRef);
+    }
+  }
+
+  function pruneOrphanKanbanCards(): void {
+    const visibleIds = new Set(kanbanVisibleTasks().map((task) => task.id));
+    kanbanBoardEl.querySelectorAll<HTMLElement>(".mv-kanban-task[data-task-id]").forEach((btn) => {
+      if (!visibleIds.has(btn.dataset.taskId || "")) btn.remove();
+    });
+  }
+
+  function ensureKanbanColumnStructure(): HTMLElement[] {
+    const existing = [...kanbanBoardEl.querySelectorAll<HTMLElement>(".mv-kanban-column")];
+    if (existing.length === KANBAN_STATUSES.length) return existing;
+    kanbanBoardEl.replaceChildren();
+    const columns: HTMLElement[] = [];
+    for (const status of KANBAN_STATUSES) {
+      const col = el("section", "mv-kanban-column");
+      col.dataset.kanbanStatus = status;
+      col.append(el("h4", "mv-kanban-column-title", `${KANBAN_STATUS_LABELS[status]} (0)`));
+      const list = el("div", "mv-kanban-column-list");
+      list.dataset.status = status;
+      list.setAttribute("aria-label", `${KANBAN_STATUS_LABELS[status]}: 0 taken`);
+      list.addEventListener("dragover", (e) => {
+        if (!kanbanDraggedTaskId) return;
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = "move";
+        list.classList.add("is-drag-over");
+      });
+      list.addEventListener("dragleave", (e) => {
+        if (!list.contains(e.relatedTarget as Node | null)) list.classList.remove("is-drag-over");
+      });
+      list.addEventListener("drop", (e) => {
+        if (!kanbanDraggedTaskId) return;
+        e.preventDefault();
+        list.classList.remove("is-drag-over");
+        const targetStatus = (list.dataset.status || status) as KanbanStatus;
+        const targetIndex = kanbanDropIndex(list, e.clientY, kanbanDraggedTaskId);
+        void moveKanbanTaskFromDrop(kanbanDraggedTaskId, targetStatus, targetIndex);
+      });
+      col.append(list);
+      kanbanBoardEl.append(col);
+      columns.push(col);
+    }
+    return columns;
+  }
+
+  function renderKanbanBoardSoft(): void {
+    const scrollByStatus = captureKanbanBoardScroll();
+    const columns = ensureKanbanColumnStructure();
+    for (let i = 0; i < KANBAN_STATUSES.length; i++) {
+      const status = KANBAN_STATUSES[i];
+      const columnTasks = kanbanTasksForColumn(status);
+      const colEl = columns[i];
+      colEl.classList.toggle("mv-kanban-column--compact", kanbanColumnUsesCompactLayout(status, columnTasks.length));
+      colEl.classList.toggle("mv-kanban-column--scrollable", columnTasks.length > KANBAN_COLUMN_COMPACT_THRESHOLD);
+      const titleEl = colEl.querySelector(".mv-kanban-column-title");
+      if (titleEl) titleEl.textContent = `${KANBAN_STATUS_LABELS[status]} (${columnTasks.length})`;
+      const list = colEl.querySelector<HTMLElement>(".mv-kanban-column-list");
+      if (!list) continue;
+      list.setAttribute("aria-label", `${KANBAN_STATUS_LABELS[status]}: ${columnTasks.length} taken`);
+      syncKanbanColumnList(list, columnTasks);
+      const savedScroll = scrollByStatus.get(status);
+      if (savedScroll != null) list.scrollTop = savedScroll;
+    }
+    pruneOrphanKanbanCards();
+    syncKanbanBoardStatusText();
+    pulseKanbanBoardSynced();
+  }
+
+  function renderKanbanBoardFull(): void {
+    kanbanBoardEl.replaceChildren();
+    for (const status of KANBAN_STATUSES) {
+      const columnTasks = kanbanTasksForColumn(status);
+      const col = el("section", "mv-kanban-column");
+      col.dataset.kanbanStatus = status;
+      if (kanbanColumnUsesCompactLayout(status, columnTasks.length)) {
+        col.classList.add("mv-kanban-column--compact");
+      }
+      if (columnTasks.length > KANBAN_COLUMN_COMPACT_THRESHOLD) {
+        col.classList.add("mv-kanban-column--scrollable");
+      }
+      col.append(el("h4", "mv-kanban-column-title", `${KANBAN_STATUS_LABELS[status]} (${columnTasks.length})`));
+      const list = el("div", "mv-kanban-column-list");
+      list.dataset.status = status;
+      list.setAttribute("aria-label", `${KANBAN_STATUS_LABELS[status]}: ${columnTasks.length} taken`);
+      list.addEventListener("dragover", (e) => {
+        if (!kanbanDraggedTaskId) return;
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = "move";
+        list.classList.add("is-drag-over");
+      });
+      list.addEventListener("dragleave", (e) => {
+        if (!list.contains(e.relatedTarget as Node | null)) list.classList.remove("is-drag-over");
+      });
+      list.addEventListener("drop", (e) => {
+        if (!kanbanDraggedTaskId) return;
+        e.preventDefault();
+        list.classList.remove("is-drag-over");
+        const targetStatus = (list.dataset.status || status) as KanbanStatus;
+        const targetIndex = kanbanDropIndex(list, e.clientY, kanbanDraggedTaskId);
+        void moveKanbanTaskFromDrop(kanbanDraggedTaskId, targetStatus, targetIndex);
+      });
+      if (!columnTasks.length) {
+        list.append(el("div", "mv-kanban-empty", "Geen taken."));
+      }
+      for (const task of columnTasks) {
+        list.append(buildKanbanTaskCard(task));
+      }
+      col.append(list);
+      kanbanBoardEl.append(col);
+    }
+    syncKanbanBoardStatusText();
+  }
+
+  function renderKanbanBoard(options: { soft?: boolean } = {}): void {
+    if (options.soft && kanbanBoardEl.querySelector(".mv-kanban-column")) {
+      renderKanbanBoardSoft();
+      return;
+    }
+    renderKanbanBoardFull();
+  }
+
+  function kanbanProjectSuggestions(): string[] {
+    const fromBoard = kanbanBoardState.tasks.map((task) => task.project.trim()).filter(Boolean);
+    return [...new Set([...kanbanProjectCatalog, ...fromBoard])].sort((a, b) => a.localeCompare(b, "nl"));
+  }
+
+  function attachKanbanProjectDatalist(input: HTMLInputElement): void {
+    const listId = "mv-kanban-project-options";
+    input.setAttribute("list", listId);
+    let datalist = document.getElementById(listId) as HTMLDataListElement | null;
+    if (!datalist) {
+      datalist = document.createElement("datalist");
+      datalist.id = listId;
+      document.body.append(datalist);
+    }
+    datalist.replaceChildren();
+    for (const project of kanbanProjectSuggestions()) {
+      const opt = document.createElement("option");
+      opt.value = project;
+      datalist.append(opt);
+    }
+  }
+
+  async function refreshKanbanProjectCatalog(): Promise<void> {
+    try {
+      const meta = await fetchKanbanMeta();
+      kanbanProjectCatalog = meta.projects;
+    } catch {
+      kanbanProjectCatalog = [];
+    }
+  }
+
+  function kanbanVisibleTasks(): KanbanTask[] {
+    const filter = kanbanProjectFilter.trim().toLowerCase();
+    if (!filter) return kanbanBoardState.tasks;
+    return kanbanBoardState.tasks.filter((task) => task.project.trim().toLowerCase() === filter);
+  }
+
+  function kanbanCompareTasksInLane(a: KanbanTask, b: KanbanTask): number {
+    const rankDiff = a.rank - b.rank;
+    if (rankDiff !== 0) return rankDiff;
+    return String(b.updatedAt || b.createdAt || "").localeCompare(String(a.updatedAt || a.createdAt || ""));
+  }
+
+  function kanbanTasksForColumn(status: KanbanStatus): KanbanTask[] {
+    return kanbanVisibleTasks()
+      .filter((task) => task.status === status)
+      .sort(kanbanCompareTasksInLane);
+  }
+
+  function applyOptimisticKanbanMove(taskId: string, targetStatus: KanbanStatus): void {
+    const current = kanbanTaskById(taskId);
+    if (!current || current.status === targetStatus) return;
+    kanbanBoardState = {
+      ...kanbanBoardState,
+      tasks: kanbanBoardState.tasks.map((task) => (task.id === taskId ? { ...task, status: targetStatus } : task)),
+    };
+    renderKanbanBoard({ soft: false });
+  }
+
+  function syncKanbanProjectFilterOptions(): void {
+    const current = kanbanProjectFilter;
+    const projects = Array.from(
+      new Set(kanbanBoardState.tasks.map((task) => task.project.trim()).filter(Boolean)),
+    ).sort((a, b) => a.localeCompare(b, "nl-NL", { sensitivity: "base" }));
+    kanbanProjectFilterSelect.replaceChildren();
+    const allOpt = document.createElement("option");
+    allOpt.value = "";
+    allOpt.textContent = "Alle projecten";
+    kanbanProjectFilterSelect.append(allOpt);
+    for (const project of projects) {
+      const opt = document.createElement("option");
+      opt.value = project;
+      opt.textContent = project;
+      kanbanProjectFilterSelect.append(opt);
+    }
+    kanbanProjectFilter = current && projects.some((p) => p.toLowerCase() === current.toLowerCase()) ? current : "";
+    kanbanProjectFilterSelect.value = kanbanProjectFilter;
+  }
+
+  function kanbanDropIndex(list: HTMLElement, clientY: number, draggedTaskId: string): number {
+    const cards = Array.from(list.querySelectorAll<HTMLElement>(".mv-kanban-task[data-task-id]")).filter(
+      (card) => card.dataset.taskId !== draggedTaskId,
+    );
+    let index = 0;
+    for (const card of cards) {
+      const rect = card.getBoundingClientRect();
+      if (clientY > rect.top + rect.height / 2) index += 1;
+    }
+    return index;
+  }
+
+  async function moveKanbanTaskFromDrop(taskId: string, targetStatus: KanbanStatus, targetIndex: number): Promise<void> {
+    if (!taskId) return;
+    const previousBoard = kanbanBoardState;
+    applyOptimisticKanbanMove(taskId, targetStatus);
+    try {
+      const payload = await moveKanbanTask(taskId, targetStatus, {
+        actor: "joost",
+        targetIndex,
+        rationale: "Verplaatst met drag-and-drop in Kanban UI.",
+      });
+      kanbanSelectedTaskId = payload.task.id;
+      setKanbanBoardFromPayload(payload.board, { soft: false, refreshDetail: false });
+      status.textContent = `Kanban-taak verplaatst naar ${KANBAN_STATUS_LABELS[targetStatus]}.`;
+    } catch (e) {
+      kanbanBoardState = previousBoard;
+      renderKanbanBoard({ soft: false });
+      status.textContent = `Kanban-taak verplaatsen mislukt: ${String((e as Error).message)}`;
+      await refreshKanbanBoard({ full: true });
+    }
+  }
+
+  function kanbanDetailField(label: string, control: HTMLElement, fullWidth = false): HTMLElement {
+    const wrap = el("div", fullWidth ? "mv-kanban-detail-field mv-kanban-detail-field--full" : "mv-kanban-detail-field");
+    const lbl = el("label", "mv-md-dialog-label", label);
+    wrap.append(lbl, control);
+    return wrap;
+  }
+
+  function kanbanDetailMetaBlock(label: string, content: HTMLElement): HTMLElement {
+    const wrap = el("div", "mv-kanban-detail-meta-block");
+    wrap.append(el("strong", "mv-email-agent-label", label), content);
+    return wrap;
+  }
+
+  function closeKanbanDetailOverlay(): void {
+    kanbanDetailOverlayOpen = false;
+    kanbanDetailOverlay.hidden = true;
+    kanbanDetail.replaceChildren();
+    kanbanDetailComments = [];
+    kanbanDetailCommentsTaskId = "";
+    refreshNexusExecuteOnActiveUi();
+  }
+
+  function openKanbanDetailOverlay(task: KanbanTask): void {
+    kanbanSelectedTaskId = task.id;
+    kanbanDetailOverlayOpen = true;
+    kanbanDetailOverlay.hidden = false;
+    renderKanbanDetail(task);
+  }
+
+  function selectKanbanTask(taskId: string): void {
+    kanbanSelectedTaskId = taskId;
+    kanbanBoardEl.querySelectorAll<HTMLElement>(".mv-kanban-task.is-selected").forEach((node) => {
+      node.classList.remove("is-selected");
+    });
+    const selected = kanbanBoardEl.querySelector<HTMLElement>(`.mv-kanban-task[data-task-id="${taskId}"]`);
+    selected?.classList.add("is-selected");
+    refreshNexusExecuteOnActiveUi();
+  }
+
+  function setKanbanBoardFromPayload(
+    payload: KanbanBoardPayload,
+    options: { soft?: boolean; refreshDetail?: boolean } = {},
+  ): void {
+    kanbanBoardState = payload;
+    syncKanbanProjectFilterOptions();
+    const visible = kanbanVisibleTasks();
+    if (kanbanSelectedTaskId && !visible.some((task) => task.id === kanbanSelectedTaskId)) {
+      kanbanSelectedTaskId = "";
+      closeKanbanDetailOverlay();
+    }
+    const soft = options.soft === true;
+    renderKanbanBoard({ soft });
+    const shouldRefreshDetail = options.refreshDetail ?? !soft;
+    if (shouldRefreshDetail && kanbanDetailOverlayOpen) {
+      const task = kanbanTaskById(kanbanSelectedTaskId);
+      if (task) renderKanbanDetail(task);
+      else closeKanbanDetailOverlay();
+    }
+  }
+
+  async function startKanbanTaskMerge(primary: KanbanTask, secondary: KanbanTask): Promise<void> {
+    kanbanSelectedTaskId = primary.id;
+    syncKanbanTaskSelection();
+    agentChatInput.value = [
+      "Fuseer onderstaande twee Kanban-taken tot één overkoepelende taak.",
+      "",
+      "Werkwijze:",
+      "- Lees de context van beide taken zorgvuldig.",
+      "- Kies één heldere overkoepelende titel, status, prioriteit, project, personen, deadline, samenvatting en concrete nextAction.",
+      "- Gebruik daarna de tool `merge_kanban_tasks`.",
+      `- Gebruik primaryId \`${primary.id}\` als taak die blijft bestaan en secondaryId \`${secondary.id}\` als taak die wordt opgenomen.`,
+      "- Verplaats of verwijder niets handmatig buiten de merge-tool om.",
+      "",
+      "## Eerste taak",
+      nexusKanbanContextBlock(primary),
+      "",
+      "## Tweede taak",
+      nexusKanbanContextBlock(secondary),
+    ].join("\n");
+    agentChatInput.focus();
+    status.textContent = "Nexus fuseert de twee Kanban-taken...";
+    await submitAgentChat();
+  }
+
+  function kanbanCommentMessageCount(thread: KanbanCommentThread): number {
+    return 1 + thread.replies.length;
+  }
+
+  function fillKanbanCommentBody(body: HTMLElement, raw: string): void {
+    const content = raw.trim();
+    body.replaceChildren();
+    body.classList.remove("mv-kanban-comment-msg-body--md", "mv-kanban-comment-msg-body--plain");
+    if (!content) {
+      body.classList.add("mv-kanban-comment-msg-body--plain");
+      body.textContent = "(Leeg)";
+      return;
+    }
+    body.classList.add("mv-kanban-comment-msg-body--md");
+    const inner = el("div", "mv-prose mv-agent-chat-md-prose");
+    inner.innerHTML = renderMarkdown(content).html;
+    linkifyAgentMarkdownReferences(inner);
+    body.append(inner);
+  }
+
+  function renderKanbanCommentMessage(author: string, createdAt: string, body: string, isReply: boolean): HTMLElement {
+    const row = el("div", `mv-kanban-comment-msg${isReply ? " mv-kanban-comment-msg--reply" : ""}`);
+    const meta = el("div", "mv-kanban-comment-msg-meta");
+    meta.textContent = [author || "Auteur onbekend", formatReviewTs(createdAt)].filter(Boolean).join(" · ");
+    const text = el("div", "mv-kanban-comment-msg-body");
+    fillKanbanCommentBody(text, body);
+    row.append(meta, text);
+    return row;
+  }
+
+  function renderKanbanCommentsInto(host: HTMLElement, taskId: string, threads: KanbanCommentThread[]): void {
+    host.replaceChildren();
+    const list = el("div", "mv-kanban-comments-list");
+    if (!threads.length) {
+      list.append(el("div", "mv-kanban-comments-empty", "Nog geen commentaar. Start een discussie hieronder."));
+    }
+    for (const thread of threads) {
+      const wrap = el("div", "mv-kanban-comment-thread");
+      const nMsg = kanbanCommentMessageCount(thread);
+      wrap.append(
+        el(
+          "div",
+          "mv-kanban-comment-thread-title",
+          nMsg >= 2 ? `Discussie (${nMsg} berichten)` : "Commentaar",
+        ),
+      );
+      const messages = el("div", "mv-kanban-comment-thread-messages");
+      messages.append(renderKanbanCommentMessage(thread.author, thread.createdAt, thread.body, false));
+      for (const reply of thread.replies) {
+        messages.append(renderKanbanCommentMessage(reply.author, reply.createdAt, reply.body, true));
+      }
+      wrap.append(messages);
+      const replyComposer = el("div", "mv-kanban-comment-reply-composer");
+      const replyInput = document.createElement("textarea");
+      replyInput.className = "mv-email-agent-context-input";
+      replyInput.rows = 2;
+      replyInput.placeholder = "Antwoord (markdown ondersteund)…";
+      const replyBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Antwoorden");
+      replyBtn.type = "button";
+      replyBtn.addEventListener("click", () =>
+        void (async () => {
+          const body = replyInput.value.trim();
+          if (!body) return;
+          replyBtn.disabled = true;
+          try {
+            await addKanbanCommentReply(taskId, thread.id, body, "joost");
+            replyInput.value = "";
+            await refreshKanbanCommentsPanel(taskId, host);
+            status.textContent = "Antwoord geplaatst.";
+          } catch (e) {
+            status.textContent = `Antwoord plaatsen mislukt: ${String((e as Error).message)}`;
+          } finally {
+            replyBtn.disabled = false;
+          }
+        })(),
+      );
+      replyComposer.append(replyInput, replyBtn);
+      wrap.append(replyComposer);
+      list.append(wrap);
+    }
+    host.append(list);
+    const composer = el("div", "mv-kanban-comments-composer");
+    const textarea = document.createElement("textarea");
+    textarea.className = "mv-email-agent-context-input";
+    textarea.rows = 3;
+    textarea.placeholder = "Nieuw commentaar (markdown ondersteund)…";
+    const postBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Plaats commentaar");
+    postBtn.type = "button";
+    postBtn.addEventListener("click", () =>
+      void (async () => {
+        const body = textarea.value.trim();
+        if (!body) return;
+        postBtn.disabled = true;
+        try {
+          await addKanbanCommentThread(taskId, body, "joost");
+          textarea.value = "";
+          await refreshKanbanCommentsPanel(taskId, host);
+          status.textContent = "Commentaar geplaatst.";
+        } catch (e) {
+          status.textContent = `Commentaar plaatsen mislukt: ${String((e as Error).message)}`;
+        } finally {
+          postBtn.disabled = false;
+        }
+      })(),
+    );
+    composer.append(textarea, postBtn);
+    host.append(composer);
+    void Promise.all([runMermaidInRoot(host), runChartJsInRoot(host)]);
+  }
+
+  async function refreshKanbanCommentsPanel(taskId: string, host: HTMLElement): Promise<void> {
+    const payload = await fetchKanbanComments(taskId);
+    kanbanDetailComments = payload.threads;
+    kanbanDetailCommentsTaskId = taskId;
+    renderKanbanCommentsInto(host, taskId, payload.threads);
+  }
+
+  function loadKanbanCommentsPanel(taskId: string, host: HTMLElement): void {
+    host.replaceChildren(el("div", "mv-kanban-comments-loading", "Commentaren laden…"));
+    void (async () => {
+      try {
+        await refreshKanbanCommentsPanel(taskId, host);
+      } catch (e) {
+        host.replaceChildren(
+          el("div", "mv-kanban-comments-error", `Commentaren laden mislukt: ${String((e as Error).message)}`),
+        );
+      }
+    })();
+  }
+
+  function renderKanbanDetail(task: KanbanTask | null): void {
+    kanbanDetail.replaceChildren();
+    if (!task) {
+      closeKanbanDetailOverlay();
+      return;
+    }
+    kanbanSelectedTaskId = task.id;
+    kanbanDetailOverlayOpen = true;
+    kanbanDetailOverlay.hidden = false;
+    const title = document.createElement("input");
+    title.className = "mv-md-dialog-input";
+    title.value = task.title;
+    const project = document.createElement("input");
+    project.className = "mv-md-dialog-input";
+    project.placeholder = "Project / klant (bestaand of nieuw)";
+    project.value = task.project;
+    attachKanbanProjectDatalist(project);
+    const people = document.createElement("input");
+    people.className = "mv-md-dialog-input";
+    people.placeholder = "Personen, gescheiden door komma's";
+    people.value = task.people.join(", ");
+    const dueDate = document.createElement("input");
+    dueDate.className = "mv-md-dialog-input";
+    dueDate.placeholder = "Deadline";
+    dueDate.value = task.dueDate;
+    const statusSelect = document.createElement("select");
+    statusSelect.className = "mv-md-dialog-input";
+    for (const s of KANBAN_STATUSES) {
+      const opt = document.createElement("option");
+      opt.value = s;
+      opt.textContent = KANBAN_STATUS_LABELS[s];
+      statusSelect.append(opt);
+    }
+    statusSelect.value = task.status;
+    const prioritySelect = document.createElement("select");
+    prioritySelect.className = "mv-md-dialog-input";
+    for (const p of ["laag", "middel", "hoog", "kritiek"]) {
+      const opt = document.createElement("option");
+      opt.value = p;
+      opt.textContent = p;
+      prioritySelect.append(opt);
+    }
+    prioritySelect.value = task.priority;
+    const nextAction = document.createElement("textarea");
+    nextAction.className = "mv-email-agent-context-input";
+    nextAction.rows = 4;
+    nextAction.placeholder = "Eerstvolgende actie";
+    nextAction.value = task.nextAction;
+    const summary = document.createElement("textarea");
+    summary.className = "mv-email-agent-context-input";
+    summary.rows = 5;
+    summary.placeholder = "Context / samenvatting";
+    summary.value = task.summary;
+    const sourceList = el(
+      "div",
+      "mv-kanban-source-list",
+      task.sourceRefs.length
+        ? task.sourceRefs.map((ref) => `${ref.type}: ${ref.label}`).join("\n")
+        : "Nog geen bronnen gekoppeld.",
+    );
+    const historyList = el(
+      "div",
+      "mv-kanban-source-list",
+      task.history.slice(-8).map((h) => `${formatEmailAgentDate(h.ts)} · ${h.event}: ${h.note}`).join("\n") || "Nog geen historie.",
+    );
+    const actionRow = el("div", "mv-email-agent-actions");
+    const saveBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Taak opslaan");
+    saveBtn.type = "button";
+    const doneBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Afgehandeld");
+    doneBtn.type = "button";
+    if (task.status === "ignored" || task.status === "done") {
+      const reopenBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Heropen in inbox");
+      reopenBtn.type = "button";
+      reopenBtn.addEventListener("click", () =>
+        void (async () => {
+          reopenBtn.disabled = true;
+          try {
+            const payload = await moveKanbanTask(task.id, "inbox", {
+              actor: "joost",
+              rationale: "Taak heropend vanuit Kanban UI.",
+            });
+            statusSelect.value = "inbox";
+            setKanbanBoardFromPayload(payload.board, { soft: false, refreshDetail: true });
+            kanbanSelectedTaskId = payload.task.id;
+            status.textContent = "Taak heropend in inbox.";
+          } catch (e) {
+            status.textContent = `Taak heropenen mislukt: ${String((e as Error).message)}`;
+          } finally {
+            reopenBtn.disabled = false;
+          }
+        })(),
+      );
+      actionRow.append(reopenBtn);
+    }
+    const mergeSelect = document.createElement("select");
+    mergeSelect.className = "mv-md-dialog-input mv-kanban-merge-select";
+    const mergePlaceholder = document.createElement("option");
+    mergePlaceholder.value = "";
+    mergePlaceholder.textContent = "Fuseer met taak...";
+    mergeSelect.append(mergePlaceholder);
+    for (const candidate of kanbanBoardState.tasks.filter((item) => item.id !== task.id && item.status !== "ignored")) {
+      const opt = document.createElement("option");
+      opt.value = candidate.id;
+      opt.textContent = `${candidate.title}${candidate.project ? ` · ${candidate.project}` : ""}`;
+      mergeSelect.append(opt);
+    }
+    const mergeBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Fuseer via Nexus");
+    mergeBtn.type = "button";
+    mergeBtn.disabled = mergeSelect.options.length <= 1;
+    actionRow.append(saveBtn, doneBtn, mergeSelect, mergeBtn);
+    const detailHead = el("div", "mv-kanban-detail-head");
+    const detailTitle = el("h4", "mv-email-agent-detail-title", task.title);
+    const closeDetailBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost mv-kanban-detail-close", "Sluiten");
+    closeDetailBtn.type = "button";
+    closeDetailBtn.title = "Taakdetails sluiten (Esc)";
+    closeDetailBtn.addEventListener("click", () => closeKanbanDetailOverlay());
+    detailHead.append(detailTitle, closeDetailBtn);
+    const projectColor = projectColorForName(task.project);
+    if (projectColor) {
+      kanbanDetail.style.setProperty("--mv-project-accent", projectColor.accent);
+      kanbanDetail.style.setProperty("--mv-project-bg", projectColor.bg);
+      kanbanDetail.dataset.projectColor = "1";
+    } else {
+      kanbanDetail.style.removeProperty("--mv-project-accent");
+      kanbanDetail.style.removeProperty("--mv-project-bg");
+      kanbanDetail.removeAttribute("data-project-color");
+    }
+    saveBtn.addEventListener("click", () =>
+      void (async () => {
+        saveBtn.disabled = true;
+        try {
+          const newStatus = statusSelect.value as KanbanStatus;
+          let boardPayload = kanbanBoardState;
+          if (newStatus !== task.status) {
+            const moved = await moveKanbanTask(task.id, newStatus, {
+              actor: "joost",
+              rationale: "Status gewijzigd in Kanban UI.",
+            });
+            boardPayload = moved.board;
+          }
+          const payload = await updateKanbanTask(task.id, {
+            title: title.value,
+            priority: prioritySelect.value as KanbanTask["priority"],
+            project: project.value,
+            people: people.value.split(",").map((p) => p.trim()).filter(Boolean),
+            dueDate: dueDate.value,
+            nextAction: nextAction.value,
+            summary: summary.value,
+            actor: "joost",
+            rationale: "Handmatig bijgewerkt in Kanban UI.",
+          });
+          setKanbanBoardFromPayload(payload.board ?? boardPayload, { soft: false, refreshDetail: true });
+          kanbanSelectedTaskId = payload.task.id;
+          status.textContent = "Kanban-taak opgeslagen.";
+        } catch (e) {
+          status.textContent = `Kanban-taak opslaan mislukt: ${String((e as Error).message)}`;
+        } finally {
+          saveBtn.disabled = false;
+        }
+      })(),
+    );
+    doneBtn.addEventListener("click", () =>
+      void (async () => {
+        const payload = await moveKanbanTask(task.id, "done", { actor: "joost", rationale: "Handmatig afgehandeld." });
+        setKanbanBoardFromPayload(payload.board, { soft: false, refreshDetail: false });
+        kanbanSelectedTaskId = payload.task.id;
+      })(),
+    );
+    mergeBtn.addEventListener("click", () =>
+      void (async () => {
+        const secondaryId = mergeSelect.value;
+        const secondary = kanbanTaskById(secondaryId);
+        if (!secondary) {
+          status.textContent = "Kies eerst een tweede taak om mee te fuseren.";
+          return;
+        }
+        if (!confirm(`Deze twee taken door Nexus laten fuseren?\n\n1. ${task.title}\n2. ${secondary.title}`)) return;
+        await startKanbanTaskMerge(task, secondary);
+      })(),
+    );
+    const detailForm = el("div", "mv-kanban-detail-form");
+    detailForm.append(
+      kanbanDetailField("Titel", title, true),
+      kanbanDetailField("Status", statusSelect),
+      kanbanDetailField("Prioriteit", prioritySelect),
+      kanbanDetailField("Project", project),
+      kanbanDetailField("Deadline", dueDate),
+      kanbanDetailField("Personen", people, true),
+      kanbanDetailField("Next action", nextAction, true),
+      kanbanDetailField("Samenvatting", summary, true),
+    );
+    const detailMeta = el("div", "mv-kanban-detail-meta");
+    detailMeta.append(kanbanDetailMetaBlock("Bronnen", sourceList), kanbanDetailMetaBlock("Historie", historyList));
+    const commentsHost = el("div", "mv-kanban-comments");
+    const commentsSection = el("section", "mv-kanban-detail-comments");
+    commentsSection.append(el("strong", "mv-email-agent-label", "Commentaren"), commentsHost);
+    const detailBody = el("div", "mv-kanban-detail-body");
+    detailBody.append(detailForm, detailMeta, commentsSection);
+    actionRow.classList.add("mv-kanban-detail-actions");
+    kanbanDetail.append(detailHead, detailBody, actionRow);
+    loadKanbanCommentsPanel(task.id, commentsHost);
+    syncKanbanTaskSelection();
+    refreshNexusExecuteOnActiveUi();
+  }
+
+  function handleKanbanOverlayEscape(e: KeyboardEvent): void {
+    if (e.key !== "Escape" || !kanbanDetailOverlayOpen || activeMainAppView !== "kanban") return;
+    if (kanbanDetailHasFocusedEditor()) return;
+    e.preventDefault();
+    closeKanbanDetailOverlay();
+  }
+
+  function kanbanDetailHasFocusedEditor(): boolean {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) return false;
+    if (!kanbanDetail.contains(active)) return false;
+    return active.matches("input, textarea, select, button");
+  }
+
+  async function refreshKanbanBoard(
+    options: { silent?: boolean; skipFocusedDetail?: boolean; soft?: boolean; full?: boolean } = {},
+  ): Promise<void> {
+    if (kanbanRefreshBusy) return;
+    if (options.silent && kanbanDetailOverlayOpen) return;
+    if (options.skipFocusedDetail && kanbanDetailHasFocusedEditor()) return;
+    if (options.skipFocusedDetail && kanbanDraggedTaskId) return;
+    kanbanRefreshBusy = true;
+    if (!options.silent) kanbanRefreshBtn.disabled = true;
+    try {
+      const soft = options.full ? false : options.soft !== false;
+      await refreshKanbanProjectCatalog();
+      setKanbanBoardFromPayload(await fetchKanbanBoard({ limit: 500 }), { soft, refreshDetail: false });
+    } catch (e) {
+      if (!options.silent) kanbanStatusText.textContent = `Kanban laden mislukt: ${String((e as Error).message)}`;
+    } finally {
+      kanbanRefreshBusy = false;
+      if (!options.silent) kanbanRefreshBtn.disabled = false;
+    }
+  }
+
+  function maybeAutoRefreshKanbanBoard(): void {
+    if (activeMainAppView !== "kanban") return;
+    if (document.visibilityState !== "visible") return;
+    if (kanbanDetailOverlayOpen) return;
+    void refreshKanbanBoard({ silent: true, soft: true, skipFocusedDetail: true });
+  }
+
+  async function createBlankKanbanTask(): Promise<void> {
+    const payload = await createKanbanTask({
+      title: "Nieuwe taak",
+      status: "inbox",
+      priority: "middel",
+      project: kanbanProjectFilter,
+      nextAction: "Beschrijf de eerstvolgende actie.",
+      actor: "joost",
+      rationale: "Handmatig aangemaakt in Kanban UI.",
+      sourceRefs: [{ type: "manual", label: "Handmatig aangemaakt in iOMS" } as KanbanTask["sourceRefs"][number]],
+    });
+    kanbanSelectedTaskId = payload.task.id;
+    kanbanDetailOverlayOpen = true;
+    kanbanDetailOverlay.hidden = false;
+    setKanbanBoardFromPayload(payload.board);
+    renderKanbanDetail(kanbanTaskById(payload.task.id));
+  }
+
+  function openKanbanPanel(): void {
+    setMainAppView("kanban");
+    void refreshKanbanProjectCatalog();
+    void refreshKanbanBoard({ full: true });
+  }
+
+  async function openKanbanTask(taskId: string): Promise<void> {
+    const id = taskId.trim();
+    if (!id) {
+      openKanbanPanel();
+      return;
+    }
+    kanbanSelectedTaskId = id;
+    setMainAppView("kanban");
+    if (kanbanRefreshBusy) return;
+    kanbanRefreshBusy = true;
+    kanbanRefreshBtn.disabled = true;
+    try {
+      const payload = await fetchKanbanBoard({ limit: 500 });
+      const taskOnBoard = payload.tasks.find((task) => task.id === id) || null;
+      if (taskOnBoard) {
+        const filter = kanbanProjectFilter.trim().toLowerCase();
+        const project = taskOnBoard.project.trim().toLowerCase();
+        if (filter && project !== filter) kanbanProjectFilter = "";
+      }
+      setKanbanBoardFromPayload(payload);
+      const task = kanbanTaskById(id);
+      if (task) {
+        openKanbanDetailOverlay(task);
+        requestAnimationFrame(() => {
+          kanbanBoardEl
+            .querySelector<HTMLElement>(`.mv-kanban-task[data-task-id="${id}"]`)
+            ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        });
+      } else {
+        closeKanbanDetailOverlay();
+        kanbanSelectedTaskId = "";
+        kanbanStatusText.textContent = `Taak ${id} niet gevonden op het bord.`;
+      }
+    } catch (e) {
+      kanbanStatusText.textContent = `Kanban laden mislukt: ${String((e as Error).message)}`;
+    } finally {
+      kanbanRefreshBusy = false;
+      kanbanRefreshBtn.disabled = false;
+    }
+  }
+
+  function formatEmailAgentDate(value: string): string {
+    if (!value) return "onbekende datum";
+    const d = new Date(value);
+    if (!Number.isFinite(d.getTime())) return value;
+    return d.toLocaleString("nl-NL", { dateStyle: "short", timeStyle: "short" });
+  }
+
+  function emailAgentStatusText(payload: {
+    config: EmailAgentConfig;
+    unreadCount: number;
+    lastAttemptAt?: string;
+    lastSuccessfulScanAt?: string;
+    lastError?: string;
+    running?: boolean;
+    nextRunAt?: string;
+  }): string {
+    const lastCheck = [payload.lastAttemptAt || "", payload.lastSuccessfulScanAt || ""].filter(Boolean).sort().at(-1) || "";
+    const parts = [
+      `Status: ${payload.config.enabled ? "aan" : "uit"}`,
+      `${payload.unreadCount} ongelezen`,
+      `laatste check: ${lastCheck ? formatEmailAgentDate(lastCheck) : "nog niet"}`,
+    ];
+    if (payload.lastSuccessfulScanAt && payload.lastSuccessfulScanAt !== lastCheck) {
+      parts.push(`laatste succesvol: ${formatEmailAgentDate(payload.lastSuccessfulScanAt)}`);
+    }
+    if (payload.running) parts.push("nu bezig");
+    if (payload.config.enabled && payload.nextRunAt) {
+      parts.push(`volgende check: ${formatEmailAgentDate(payload.nextRunAt)}`);
+    }
+    if (payload.lastError) parts.push(`fout: ${payload.lastError}`);
+    return parts.join(" · ");
+  }
+
+  function emailAgentStatusLabel(status: EmailAgentNotification["status"]): string {
+    if (status === "read") return "gelezen";
+    if (status === "action_completed") return "afgehandeld";
+    if (status === "archived") return "gearchiveerd";
+    return "nieuw";
+  }
+
+  function setEmailAgentConfigFields(config: EmailAgentConfig): void {
+    emailAgentEnabledCb.checked = config.enabled;
+    emailAgentIntervalInput.value = String(config.intervalMinutes);
+    emailAgentWindowInput.value = String(config.scanWindowHours);
+    emailAgentMaxInput.value = String(config.maxPerFolder);
+    emailAgentInboxCb.checked = true;
+    emailAgentLlmCb.checked = config.classifyWithLlm;
+  }
+
+  let emailAgentStatusRequestSeq = 0;
+
+  function readEmailAgentConfigFields(): Partial<EmailAgentConfig> {
+    return {
+      enabled: emailAgentEnabledCb.checked,
+      intervalMinutes: Number(emailAgentIntervalInput.value || 30),
+      scanWindowHours: Number(emailAgentWindowInput.value || 24),
+      maxPerFolder: Number(emailAgentMaxInput.value || 20),
+      folders: ["inbox", "sent"],
+      classifyWithLlm: emailAgentLlmCb.checked,
+    };
+  }
+
+  function maybeShowBrowserEmailNotification(notification: EmailAgentNotification): void {
+    if (!("Notification" in window)) return;
+    if (Notification.permission !== "granted") return;
+    try {
+      new Notification(notification.title || "Nieuwe e-mailactie", {
+        body: notification.summary || notification.action || "De e-mailagent heeft een nieuw item gevonden.",
+        tag: notification.id,
+      });
+    } catch {
+      /* Browser kan notificaties blokkeren in sommige contexten. */
+    }
+  }
+
+  function kanbanSourceRefFromEmail(notification: EmailAgentNotification): KanbanTask["sourceRefs"][number] {
+    return {
+      id: `email:${notification.entryId || notification.id}`,
+      type: "email",
+      label: notification.subject || notification.title || "E-mail",
+      entryId: notification.entryId || "",
+      storeId: notification.storeId || "",
+      notificationId: notification.id,
+      path: notification.memoryPath || "",
+      timestamp: notification.mailDate || notification.createdAt || "",
+      url: "",
+    };
+  }
+
+  function kanbanPriorityFromEmail(priority: string): KanbanTask["priority"] {
+    if (priority === "hoog") return "hoog";
+    if (priority === "laag") return "laag";
+    return "middel";
+  }
+
+  async function createKanbanTaskFromEmail(notification: EmailAgentNotification): Promise<void> {
+    const payload = await ingestKanbanSignal({
+      actor: "joost",
+      signal: {
+        title: notification.title || notification.subject || "E-mail opvolgen",
+        status: notification.priority === "hoog" ? "today" : "inbox",
+        priority: kanbanPriorityFromEmail(notification.priority),
+        project: notification.tags?.[0] || "",
+        people: [notification.from].filter(Boolean),
+        nextAction: notification.action || "Bepaal de opvolging voor deze e-mail.",
+        summary: notification.summary || notification.importanceReason || "",
+        sourceRef: kanbanSourceRefFromEmail(notification),
+      },
+    });
+    if (payload.board) setKanbanBoardFromPayload(payload.board, { soft: true, refreshDetail: false });
+    if (payload.task?.id) {
+      const updated = await updateEmailAgentNotification(notification.id, { kanbanTaskId: payload.task.id });
+      emailAgentNotifications = emailAgentNotifications.map((n) => (n.id === notification.id ? updated : n));
+      renderEmailAgentNotifications();
+      status.textContent = `Kanban-taak gekoppeld: ${payload.task.title}`;
+    }
+  }
+
+  async function linkEmailToSelectedKanbanTask(notification: EmailAgentNotification): Promise<void> {
+    const task = kanbanTaskById(kanbanSelectedTaskId);
+    if (!task) {
+      status.textContent = "Selecteer eerst een Kanban-taak in de Kanban-weergave.";
+      openKanbanPanel();
+      return;
+    }
+    const payload = await updateKanbanTask(task.id, {
+      sourceRefs: [kanbanSourceRefFromEmail(notification)],
+      actor: "joost",
+      rationale: "E-mail handmatig gekoppeld vanuit e-mailagent.",
+    });
+    setKanbanBoardFromPayload(payload.board);
+    const updated = await updateEmailAgentNotification(notification.id, { kanbanTaskId: payload.task.id });
+    emailAgentNotifications = emailAgentNotifications.map((n) => (n.id === notification.id ? updated : n));
+    renderEmailAgentNotifications();
+    status.textContent = `E-mail gekoppeld aan Kanban-taak: ${payload.task.title}`;
+  }
+
+  function renderEmailAgentDetail(notification: EmailAgentNotification | null): void {
+    emailAgentDetail.replaceChildren();
+    if (!notification) {
+      emailAgentSelectedNotificationId = "";
+      emailAgentDetail.append(el("div", "mv-email-agent-empty", "Selecteer een notificatie voor details."));
+      refreshNexusExecuteOnActiveUi();
+      return;
+    }
+    emailAgentSelectedNotificationId = notification.id;
+    const title = el("h4", "mv-email-agent-detail-title", notification.title || notification.subject || "E-mail");
+    const meta = el(
+      "div",
+      "mv-email-agent-meta",
+      `${formatEmailAgentDate(notification.mailDate)} · ${notification.direction} · ${notification.priority}`,
+    );
+    const summary = el("p", "mv-email-agent-detail-text", notification.summary || "Geen samenvatting.");
+    const why = el(
+      "p",
+      "mv-email-agent-detail-text",
+      notification.importanceReason || "Geen reden vastgelegd. Ververs de lijst; oudere notificaties worden vanuit de memory-notitie aangevuld.",
+    );
+    const action = el(
+      "p",
+      "mv-email-agent-detail-text",
+      notification.action || "Geen concrete actie vastgelegd. Open eventueel de memory-notitie voor de volledige extractie.",
+    );
+    const memory = el("div", "mv-email-agent-meta", notification.memoryPath ? `Memory: ${notification.memoryPath}` : "");
+    const kanbanWrap = el("div", "mv-email-agent-fullmail");
+    const kanbanMeta = el(
+      "div",
+      "mv-email-agent-meta",
+      notification.kanbanTaskId ? `Gekoppelde taak: ${notification.kanbanTaskId}` : "Nog niet gekoppeld aan een Kanban-taak.",
+    );
+    const kanbanActions = el("div", "mv-email-agent-actions");
+    const kanbanCreateBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", notification.kanbanTaskId ? "Taak openen" : "Maak taak");
+    kanbanCreateBtn.type = "button";
+    const kanbanLinkSelectedBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Koppel aan geselecteerde taak");
+    kanbanLinkSelectedBtn.type = "button";
+    const kanbanIgnoreBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Geen taak nodig");
+    kanbanIgnoreBtn.type = "button";
+    kanbanCreateBtn.addEventListener("click", () =>
+      void (async () => {
+        kanbanCreateBtn.disabled = true;
+        try {
+          if (notification.kanbanTaskId) {
+            await openKanbanTask(notification.kanbanTaskId);
+            return;
+          }
+          await createKanbanTaskFromEmail(notification);
+        } catch (e) {
+          status.textContent = `Kanban-taak maken mislukt: ${String((e as Error).message)}`;
+        } finally {
+          kanbanCreateBtn.disabled = false;
+        }
+      })(),
+    );
+    kanbanLinkSelectedBtn.addEventListener("click", () =>
+      void (async () => {
+        kanbanLinkSelectedBtn.disabled = true;
+        try {
+          await linkEmailToSelectedKanbanTask(notification);
+        } catch (e) {
+          status.textContent = `E-mail aan Kanban koppelen mislukt: ${String((e as Error).message)}`;
+        } finally {
+          kanbanLinkSelectedBtn.disabled = false;
+        }
+      })(),
+    );
+    kanbanIgnoreBtn.addEventListener("click", () =>
+      void (async () => {
+        await ingestKanbanSignal({
+          actor: "joost",
+          signal: {
+            title: notification.title || notification.subject,
+            summary: notification.summary,
+            sourceRef: kanbanSourceRefFromEmail(notification),
+          },
+          decision: { action: "ignore", rationale: "Gebruiker gaf aan dat geen Kanban-taak nodig is." },
+        });
+        status.textContent = "Kanban-signaal genegeerd; er is geen taak aangemaakt.";
+      })(),
+    );
+    kanbanActions.append(kanbanCreateBtn, kanbanLinkSelectedBtn, kanbanIgnoreBtn);
+    kanbanWrap.append(kanbanActions, kanbanMeta);
+    const fullMailWrap = el("div", "mv-email-agent-fullmail");
+    const fullMailActions = el("div", "mv-email-agent-actions");
+    const fullMailBtn = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "E-mail opnieuw laden");
+    fullMailBtn.type = "button";
+    fullMailBtn.hidden = !notification.entryId;
+    const fullMailStatus = el(
+      "div",
+      "mv-email-agent-meta",
+      notification.entryId ? "Volledige e-mail wordt geladen…" : "Originele Outlook entryId ontbreekt.",
+    );
+    const fullMailBody = document.createElement("pre");
+    fullMailBody.className = "mv-email-agent-fullmail-body";
+    fullMailBody.hidden = true;
+    const renderFullMail = (item: OutlookMailReadItem) => {
+      const headerLines = [
+        item.subject ? `Onderwerp: ${item.subject}` : "",
+        item.senderName || item.senderEmail ? `Van: ${[item.senderName, item.senderEmail].filter(Boolean).join(" <")}${item.senderEmail && item.senderName ? ">" : ""}` : "",
+        item.to ? `Aan: ${item.to}` : "",
+        item.cc ? `CC: ${item.cc}` : "",
+        item.receivedTime || item.sentOn ? `Datum: ${formatEmailAgentDate(item.receivedTime || item.sentOn)}` : "",
+        item.hasAttachments ? "Bijlagen: ja" : "",
+      ].filter(Boolean);
+      fullMailBody.textContent = `${headerLines.join("\n")}\n\n${item.bodySnippet || "(Geen bodytekst gevonden.)"}`;
+      fullMailBody.hidden = false;
+      fullMailStatus.textContent = `Volledige e-mail geladen (${(item.bodySnippet || "").length.toLocaleString("nl-NL")} tekens).`;
+      fullMailBtn.hidden = false;
+    };
+    const loadFullMail = async (options: { force?: boolean } = {}) => {
+      if (!notification.entryId) return;
+      const cached = emailAgentFullMailCache.get(notification.id);
+      if (!options.force && cached) {
+        renderFullMail(cached);
+        return;
+      }
+      fullMailBtn.disabled = true;
+      fullMailStatus.textContent = "Volledige e-mail wordt uit Outlook gelezen…";
+      try {
+        const payload = await readOutlookMail({
+          entryId: notification.entryId,
+          storeId: notification.storeId,
+          bodyMaxChars: 120000,
+        });
+        if (!payload.item) throw new Error("Outlook gaf geen mailitem terug.");
+        emailAgentFullMailCache.set(notification.id, payload.item);
+        renderFullMail(payload.item);
+      } catch (e) {
+        fullMailStatus.textContent = `Volledige e-mail lezen mislukt: ${String((e as Error).message)}`;
+      } finally {
+        fullMailBtn.disabled = false;
+      }
+    };
+    fullMailBtn.addEventListener("click", () => void loadFullMail({ force: true }));
+    fullMailActions.append(fullMailBtn);
+    fullMailWrap.append(fullMailActions, fullMailStatus, fullMailBody);
+    if (notification.entryId) void loadFullMail();
+    const actions = el("div", "mv-email-agent-actions");
+    const reply = el("button", "mv-ribbon-btn mv-ribbon-btn--primary", "Antwoord maken");
+    reply.type = "button";
+    reply.disabled = !notification.entryId;
+    reply.title = notification.entryId
+      ? "Nexus schrijft een antwoord en maakt een Outlook-concept op deze mail."
+      : "Originele Outlook entryId ontbreekt; reply-concept kan niet worden gemaakt.";
+    const markRead = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Gelezen");
+    markRead.type = "button";
+    const complete = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Afgehandeld");
+    complete.type = "button";
+    const archive = el("button", "mv-ribbon-btn mv-ribbon-btn--ghost", "Archiveer");
+    archive.type = "button";
+    const updateStatus = async (nextStatus: EmailAgentNotification["status"]) => {
+      markRead.disabled = true;
+      complete.disabled = true;
+      archive.disabled = true;
+      const label = emailAgentStatusLabel(nextStatus);
+      try {
+        const updated = await updateEmailAgentNotification(notification.id, { status: nextStatus });
+        emailAgentNotifications = emailAgentNotifications.map((n) => (n.id === notification.id ? updated : n));
+        emailAgentPanelStatus.textContent = `Notificatie gemarkeerd als ${label}.`;
+        status.textContent = `E-mailnotificatie gemarkeerd als ${label}.`;
+        renderEmailAgentNotifications();
+        await refreshEmailAgentStatus();
+      } catch (e) {
+        status.textContent = `E-mailnotificatie bijwerken mislukt: ${String((e as Error).message)}`;
+        emailAgentPanelStatus.textContent = status.textContent;
+      } finally {
+        markRead.disabled = false;
+        complete.disabled = false;
+        archive.disabled = false;
+      }
+    };
+    markRead.disabled = notification.status === "read";
+    complete.disabled = notification.status === "action_completed";
+    archive.disabled = notification.status === "archived";
+    reply.addEventListener("click", () =>
+      void (async () => {
+        if (!notification.entryId) return;
+        reply.disabled = true;
+        const oldText = reply.textContent || "Antwoord maken";
+        reply.textContent = "Concept maken…";
+        emailAgentPanelStatus.textContent = "Nexus schrijft antwoord en maakt Outlook-concept…";
+        status.textContent = emailAgentPanelStatus.textContent;
+        try {
+          const payload = await createEmailAgentReplyDraft(notification.id, { display: true });
+          status.textContent = `Reply-concept aangemaakt in Outlook${payload.runId ? ` (run-id: ${payload.runId})` : ""}.`;
+          emailAgentPanelStatus.textContent = payload.draft.message || "Reply-concept aangemaakt in Outlook.";
+          await refreshEmailAgentAll();
+        } catch (e) {
+          status.textContent = `Reply-concept maken mislukt: ${String((e as Error).message)}`;
+          emailAgentPanelStatus.textContent = status.textContent;
+        } finally {
+          reply.disabled = !notification.entryId;
+          reply.textContent = oldText;
+        }
+      })(),
+    );
+    markRead.addEventListener("click", () => void updateStatus("read"));
+    complete.addEventListener("click", () => void updateStatus("action_completed"));
+    archive.addEventListener("click", () => void updateStatus("archived"));
+    actions.append(reply, markRead, complete, archive);
+    emailAgentDetail.append(
+      title,
+      meta,
+      el("strong", "mv-email-agent-label", "Samenvatting"),
+      summary,
+      el("strong", "mv-email-agent-label", "Waarom belangrijk"),
+      why,
+      el("strong", "mv-email-agent-label", "Voorgestelde actie"),
+      action,
+      el("strong", "mv-email-agent-label", "Gekoppelde taak"),
+      kanbanWrap,
+      el("strong", "mv-email-agent-label", "Originele e-mail"),
+      fullMailWrap,
+      memory,
+      actions,
+    );
+    refreshNexusExecuteOnActiveUi();
+  }
+
+  function renderEmailAgentNotifications(): void {
+    const unread = emailAgentNotifications.filter((n) => n.status === "unread").length;
+    emailAgentUnreadBadge.textContent = String(unread);
+    emailAgentUnreadBadge.hidden = unread === 0;
+    emailAgentBtn.textContent = unread > 0 ? `E-mail (${unread})` : "E-mail";
+    emailAgentList.replaceChildren();
+    const visibleNotifications = emailAgentNotifications.filter((n) => n.status !== "archived");
+    if (!visibleNotifications.length) {
+      emailAgentList.append(el("div", "mv-email-agent-empty", "Geen e-mails met actie nodig."));
+      renderEmailAgentDetail(null);
+      return;
+    }
+    for (const item of visibleNotifications) {
+      const btn = el("button", `mv-email-agent-item mv-email-agent-item--${item.status}`);
+      btn.type = "button";
+      const title = el("span", "mv-email-agent-item-title", item.title || item.subject || "(geen onderwerp)");
+      const meta = el(
+        "span",
+        "mv-email-agent-item-meta",
+        `${formatEmailAgentDate(item.mailDate)} · ${item.priority} · ${emailAgentStatusLabel(item.status)}`,
+      );
+      const summary = el("span", "mv-email-agent-item-summary", item.summary || item.action || "");
+      btn.append(title, meta, summary);
+      btn.addEventListener("click", () => renderEmailAgentDetail(item));
+      emailAgentList.append(btn);
+    }
+    const selected =
+      visibleNotifications.find((n) => n.id === emailAgentSelectedNotificationId) || visibleNotifications[0] || null;
+    renderEmailAgentDetail(selected);
+  }
+
+  async function refreshEmailAgentNotifications(options: { notifyNew?: boolean } = {}): Promise<void> {
+    const payload = await fetchEmailAgentNotifications({ limit: 100 });
+    const previous = emailAgentKnownNotificationIds;
+    emailAgentNotifications = payload.notifications;
+    emailAgentKnownNotificationIds = new Set(emailAgentNotifications.map((n) => n.id));
+    if (options.notifyNew) {
+      for (const n of emailAgentNotifications) {
+        if (n.status === "unread" && !previous.has(n.id)) maybeShowBrowserEmailNotification(n);
+      }
+    }
+    renderEmailAgentNotifications();
+  }
+
+  async function refreshEmailAgentStatus(): Promise<void> {
+    const seq = ++emailAgentStatusRequestSeq;
+    const payload = await fetchEmailAgentStatus();
+    if (seq !== emailAgentStatusRequestSeq) return;
+    setEmailAgentConfigFields(payload.config);
+    emailAgentSettingsStatus.textContent = emailAgentStatusText(payload);
+    emailAgentPanelStatus.textContent = emailAgentSettingsStatus.textContent;
+  }
+
+  async function refreshEmailAgentAll(options: { notifyNew?: boolean } = {}): Promise<void> {
+    try {
+      await Promise.all([refreshEmailAgentStatus(), refreshEmailAgentNotifications(options)]);
+    } catch (e) {
+      emailAgentPanelStatus.textContent = `E-mailagent laden mislukt: ${String((e as Error).message)}`;
+      emailAgentSettingsStatus.textContent = emailAgentPanelStatus.textContent;
+    }
+  }
+
+  async function saveEmailAgentConfigFromSettings(): Promise<void> {
+    emailAgentSettingsSaveBtn.disabled = true;
+    const desiredConfig = readEmailAgentConfigFields();
+    emailAgentStatusRequestSeq += 1;
+    try {
+      setEmailAgentConfigFields({
+        enabled: desiredConfig.enabled === true,
+        intervalMinutes: Number(desiredConfig.intervalMinutes || 30),
+        scanWindowHours: Number(desiredConfig.scanWindowHours || 24),
+        maxPerFolder: Number(desiredConfig.maxPerFolder || 20),
+        folders: ["inbox", "sent"],
+        classifyWithLlm: desiredConfig.classifyWithLlm !== false,
+      });
+      const payload = await saveEmailAgentConfig(desiredConfig);
+      setEmailAgentConfigFields(payload.config);
+      const stateLabel = payload.config.enabled ? "aan" : "uit";
+      status.textContent = `E-mailagentinstellingen opgeslagen; periodiek scannen staat ${stateLabel}.`;
+      emailAgentSettingsStatus.textContent = emailAgentStatusText(payload);
+      emailAgentPanelStatus.textContent = emailAgentSettingsStatus.textContent;
+      await refreshEmailAgentNotifications();
+    } catch (e) {
+      status.textContent = `E-mailagent opslaan mislukt: ${String((e as Error).message)}`;
+    } finally {
+      emailAgentSettingsSaveBtn.disabled = false;
+    }
+  }
+
+  async function runEmailAgentScanFromUi(): Promise<void> {
+    emailAgentScanBtn.disabled = true;
+    emailAgentSettingsScanBtn.disabled = true;
+    try {
+      emailAgentPanelStatus.textContent = "E-mailagent scant Outlook en herbeoordeelt vandaag…";
+      const payload = await runEmailAgentScan({ forceReprocess: true });
+      status.textContent =
+        `E-mail herbeoordeling klaar: ${payload.stats.stored} opgeslagen/bijgewerkt, ${payload.stats.ignored} genegeerd, ` +
+        `${payload.stats.skipped} overgeslagen, ${payload.stats.errors} fout(en).`;
+      emailAgentPanelStatus.textContent = `Laatste handmatige check: ${formatEmailAgentDate(payload.finishedAt)}`;
+      await refreshEmailAgentAll({ notifyNew: true });
+    } catch (e) {
+      status.textContent = `E-mail scan mislukt: ${String((e as Error).message)}`;
+      emailAgentPanelStatus.textContent = status.textContent;
+    } finally {
+      emailAgentScanBtn.disabled = false;
+      emailAgentSettingsScanBtn.disabled = false;
+    }
+  }
+
+  function openEmailAgentPanel(): void {
+    setMainAppView("email");
+    void refreshEmailAgentAll();
+    requestAnimationFrame(() => emailAgentRefreshBtn.focus());
+  }
+
   async function refreshSettingsAgentInstructions() {
     try {
       const payload = await fetchAgentInstructions();
       agentInstructionsText.value = payload.content;
       agentInstructionsPath.textContent = payload.path ? `Bestand: ${payload.path}` : "";
     } catch (e) {
-      status.textContent = `Agent-instructies lezen mislukt: ${String((e as Error).message)}`;
+      status.textContent = `Nexus-instructies lezen mislukt: ${String((e as Error).message)}`;
     }
   }
 
@@ -2464,9 +4268,9 @@ ${transcript}`;
       const payload = await saveAgentInstructions(agentInstructionsText.value);
       agentInstructionsText.value = payload.content;
       agentInstructionsPath.textContent = payload.path ? `Bestand: ${payload.path}` : "";
-      status.textContent = "Agent-instructies opgeslagen.";
+      status.textContent = "Nexus-instructies opgeslagen.";
     } catch (e) {
-      status.textContent = `Agent-instructies opslaan mislukt: ${String((e as Error).message)}`;
+      status.textContent = `Nexus-instructies opslaan mislukt: ${String((e as Error).message)}`;
     } finally {
       agentInstructionsSaveBtn.disabled = false;
     }
@@ -2475,23 +4279,20 @@ ${transcript}`;
   function populateAgentModelOptions(models: string[], selectedModel: string): void {
     const selected = selectedModel.trim();
     const unique = Array.from(new Set(models.map((m) => m.trim()).filter(Boolean)));
-    if (selected && !unique.includes(selected)) unique.unshift(selected);
+    if (!unique.includes("auto")) unique.unshift("auto");
+    if (selected && selected !== "auto" && !unique.includes(selected)) unique.splice(1, 0, selected);
     agentModel.replaceChildren();
-    if (!unique.length) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "Geen modellen geladen";
-      agentModel.append(opt);
-      agentModel.value = "";
-      return;
-    }
-    for (const model of unique) {
+    const autoOpt = document.createElement("option");
+    autoOpt.value = "auto";
+    autoOpt.textContent = "Auto (slim routeren)";
+    agentModel.append(autoOpt);
+    for (const model of unique.filter((m) => m !== "auto")) {
       const opt = document.createElement("option");
       opt.value = model;
       opt.textContent = model;
       agentModel.append(opt);
     }
-    agentModel.value = selected && unique.includes(selected) ? selected : unique[0] || "";
+    agentModel.value = selected && (selected === "auto" || unique.includes(selected)) ? selected : "auto";
   }
 
   async function loadAgentModelOptions(selectedModel = agentModel.value): Promise<void> {
@@ -2514,6 +4315,43 @@ ${transcript}`;
     }
   }
 
+  async function refreshAgentModelCatalogPanel(): Promise<void> {
+    const isAuto = agentModel.value.trim().toLowerCase() === "auto";
+    agentModelCatalogHost.hidden = !isAuto;
+    agentModelRouterStatsBtn.hidden = !isAuto;
+    if (!isAuto) return;
+    agentModelCatalogPre.textContent = "Catalogus laden…";
+    try {
+      const payload = await fetchAgentModelCatalog();
+      const lines = payload.models.slice(0, 24).map((m) => {
+        const aff = m.phaseAffinity || {};
+        return `${m.id} · tier=${m.reasoningTier} · tools=${m.toolCalling} · ophalen=${aff.retrieval?.toFixed?.(1) ?? aff.retrieval}`;
+      });
+      agentModelCatalogPre.textContent = lines.length
+        ? lines.join("\n")
+        : "Geen modellen — klik Modellen laden en controleer endpoint/API key.";
+    } catch (e) {
+      agentModelCatalogPre.textContent = `Catalogus laden mislukt: ${String((e as Error).message)}`;
+    }
+  }
+
+  agentModelRouterStatsBtn.addEventListener("click", async () => {
+    try {
+      const stats = await fetchModelRouterStats();
+      const parts: string[] = [];
+      const top = stats.topByPhase || {};
+      for (const [phase, rows] of Object.entries(top)) {
+        const best = rows?.[0];
+        if (best?.model) parts.push(`${phase}: ${best.model} (score ${best.avgScore?.toFixed?.(2) ?? "?"})`);
+      }
+      agentModelCatalogPre.textContent = parts.length
+        ? `Router-statistieken (top per fase):\n${parts.join("\n")}`
+        : "Nog geen router-statistieken — voer eerst Auto-chats uit.";
+    } catch (e) {
+      agentModelCatalogPre.textContent = `Statistieken laden mislukt: ${String((e as Error).message)}`;
+    }
+  });
+
   async function showSettingsDialog() {
     try {
       const cfg = await fetchAgentConfig();
@@ -2524,11 +4362,13 @@ ${transcript}`;
         ? "API key aanwezig (leeg laten om te behouden)"
         : "API key";
       void loadAgentModelOptions(cfg.model);
+      void refreshAgentModelCatalogPanel();
     } catch (e) {
       status.textContent = `Agentconfig lezen mislukt: ${String((e as Error).message)}`;
     }
     void refreshSettingsAgentLogs();
     void refreshSettingsAgentInstructions();
+    void refreshEmailAgentAll();
     agentDebugLlmCb.checked = readAgentDebugLlm();
     settingsDialog.hidden = false;
     agentEndpoint.focus();
@@ -2678,6 +4518,12 @@ ${transcript}`;
     return i >= 0 ? relPath.slice(i + 1) : relPath;
   }
 
+  function displayNameMd(relPath: string): string {
+    const base = baseNameMd(relPath);
+    if (base.startsWith("_draft-") && base.toLowerCase().endsWith(".md")) return "Naamloos document";
+    return base;
+  }
+
   function syncToolbarDocTitle() {
     const v = fileSelect.value.trim();
     if (!v) {
@@ -2699,8 +4545,8 @@ ${transcript}`;
       mobileDocName.title = toolbarDocName.title;
       return;
     }
-    toolbarDocName.textContent = baseNameMd(v);
-    mobileDocName.textContent = baseNameMd(v);
+    toolbarDocName.textContent = displayNameMd(v);
+    mobileDocName.textContent = displayNameMd(v);
     toolbarDocName.title = v;
     mobileDocName.title = v;
   }
@@ -2956,6 +4802,10 @@ ${transcript}`;
     const full = reviewDraftRange.toString();
     commentSelectionQuote.textContent = full.length > 400 ? `${full.slice(0, 400)}…` : full;
     commentSelectionHost.hidden = false;
+    if (activeMainAppView === "documents" && nexusActiveObjectAvailable()) {
+      nexusExecuteOnActiveObject = true;
+      agentChatMode = "agent";
+    }
     refreshAgentChatModeUi();
     syncAgentChatDisabled();
     agentChatInput.focus();
@@ -3392,6 +5242,76 @@ ${transcript}`;
     printBtn.disabled = false;
   }
 
+  /** Na Corpus Gardener-move: editor en file explorer aan nieuw pad koppelen (inbox-bestand is weg). */
+  async function followCorpusDocumentMove(fromPath: string, saved: SaveMarkdownFileResult): Promise<string> {
+    const activePath = saved.movedTo || saved.name || fromPath;
+    if (!saved.movedTo || saved.movedTo === fromPath) return activePath;
+    if (editorBoundDoc === fromPath) editorBoundDoc = saved.movedTo;
+    if (fileSelect.value === fromPath) fileSelect.value = saved.movedTo;
+    selectedFolder = folderOfMarkdownPath(saved.movedTo);
+    expandFileTreeAncestors(saved.movedTo);
+    await loadLists(saved.movedTo, { skipSave: true });
+    syncToolbarDocTitle();
+    lastSeenCorpusOrganizerMoveAt = Date.now();
+    status.textContent = `Corpus Gardener: document verplaatst naar ${saved.movedTo}`;
+    return saved.movedTo;
+  }
+
+  /** Achtergrondverplaatsingen door Corpus Gardener (debounce/scheduler) → explorer verversen. */
+  async function maybeRefreshAfterCorpusOrganizerMove(): Promise<void> {
+    if (document.visibilityState !== "visible") return;
+    if (activeMainAppView !== "documents") return;
+    if (corpusOrganizerPollBusy) return;
+    corpusOrganizerPollBusy = true;
+    try {
+      const { events } = await fetchCorpusOrganizerActivity(1);
+      const newMoves = events.filter((ev) => {
+        if (ev.action !== "move") return false;
+        if (!ev.from || !ev.to || ev.from === ev.to) return false;
+        const ts = Date.parse(ev.ts || "");
+        return Number.isFinite(ts) && ts > lastSeenCorpusOrganizerMoveAt;
+      });
+      if (!newMoves.length) return;
+
+      lastSeenCorpusOrganizerMoveAt = Math.max(
+        lastSeenCorpusOrganizerMoveAt,
+        ...newMoves.map((ev) => Date.parse(ev.ts || "") || 0),
+      );
+
+      const currentPath =
+        editorBoundDoc && editorBoundDoc !== EXTERNAL_MARKDOWN_VALUE
+          ? editorBoundDoc
+          : fileSelect.value && fileSelect.value !== EXTERNAL_MARKDOWN_VALUE
+            ? fileSelect.value
+            : "";
+      let preferredPath = currentPath || undefined;
+      let moveMessage: string | null = null;
+
+      for (const move of newMoves) {
+        expandFileTreeAncestors(move.to!);
+        if (currentPath && move.from === currentPath) {
+          preferredPath = move.to!;
+          if (editorBoundDoc === move.from) editorBoundDoc = move.to!;
+          if (fileSelect.value === move.from) fileSelect.value = move.to!;
+          moveMessage = `Corpus Gardener: document verplaatst naar ${move.to}`;
+        }
+      }
+
+      if (preferredPath) {
+        selectedFolder = folderOfMarkdownPath(preferredPath);
+      }
+      await loadLists(preferredPath, { skipSave: true });
+      if (moveMessage) {
+        syncToolbarDocTitle();
+        status.textContent = moveMessage;
+      }
+    } catch {
+      /* stille poll */
+    } finally {
+      corpusOrganizerPollBusy = false;
+    }
+  }
+
   async function persistEditorToFile(
     targetName: string,
     reason: "manual" | "auto" = "manual",
@@ -3424,18 +5344,24 @@ ${transcript}`;
             refreshRibbonState();
             return;
           }
-          await saveMarkdownFile(targetName, md);
-          const { reviewRelativePath } = await saveReviewComments(targetName, reviewComments);
-          currentMd = md;
+          const saved = await saveMarkdownFile(targetName, mergeHiddenDocumentPrefix(hiddenDocumentPrefix, md));
+          const activePath = await followCorpusDocumentMove(targetName, saved);
+          const { reviewRelativePath } = await saveReviewComments(activePath, reviewComments);
+          currentMd = mergeHiddenDocumentPrefix(hiddenDocumentPrefix, md);
+          syncHiddenPrefixFromMarkdown(currentMd);
           isDirty = false;
           const tplPart = templatesAvailable ? tplSelect.value : "geen templatebestanden";
           if (reason === "manual") {
-            status.textContent = `${targetName} — opgeslagen — commentaren: ${reviewRelativePath} — ${tplPart}`;
+            status.textContent = saved.movedTo
+              ? `${activePath} — opgeslagen en verplaatst — commentaren: ${reviewRelativePath} — ${tplPart}`
+              : `${activePath} — opgeslagen — commentaren: ${reviewRelativePath} — ${tplPart}`;
           } else {
             const now = Date.now();
             if (now - lastAutoSaveOkAt > 2800) {
               lastAutoSaveOkAt = now;
-              status.textContent = `${targetName} — automatisch opgeslagen — ${reviewRelativePath}`;
+              status.textContent = saved.movedTo
+                ? `${activePath} — automatisch opgeslagen en verplaatst — ${reviewRelativePath}`
+                : `${activePath} — automatisch opgeslagen — ${reviewRelativePath}`;
             }
           }
           refreshRibbonState();
@@ -3471,18 +5397,24 @@ ${transcript}`;
           refreshRibbonState();
           return;
         }
-        await saveMarkdownFile(targetName, md);
-        const { reviewRelativePath } = await saveReviewComments(targetName, reviewComments);
-        currentMd = md;
+        const saved = await saveMarkdownFile(targetName, mergeHiddenDocumentPrefix(hiddenDocumentPrefix, md));
+        const activePath = await followCorpusDocumentMove(targetName, saved);
+        const { reviewRelativePath } = await saveReviewComments(activePath, reviewComments);
+        currentMd = mergeHiddenDocumentPrefix(hiddenDocumentPrefix, md);
+        syncHiddenPrefixFromMarkdown(currentMd);
         isDirty = false;
         const tplPart = templatesAvailable ? tplSelect.value : "geen templatebestanden";
         if (reason === "manual") {
-          status.textContent = `${targetName} — opgeslagen — commentaren: ${reviewRelativePath} — ${tplPart}`;
+          status.textContent = saved.movedTo
+            ? `${activePath} — opgeslagen en verplaatst — commentaren: ${reviewRelativePath} — ${tplPart}`
+            : `${activePath} — opgeslagen — commentaren: ${reviewRelativePath} — ${tplPart}`;
         } else {
           const now = Date.now();
           if (now - lastAutoSaveOkAt > 2800) {
             lastAutoSaveOkAt = now;
-            status.textContent = `${targetName} — automatisch opgeslagen — ${reviewRelativePath}`;
+            status.textContent = saved.movedTo
+              ? `${activePath} — automatisch opgeslagen en verplaatst — ${reviewRelativePath}`
+              : `${activePath} — automatisch opgeslagen — ${reviewRelativePath}`;
           }
         }
         refreshRibbonState();
@@ -3534,16 +5466,41 @@ ${transcript}`;
   }
 
   function getMarkdownForExport(): string {
+    let body = "";
     if (isEditing && editorSurfaceMode === "code" && editorCodeTextarea) {
-      return editorCodeTextarea.value;
-    }
-    if (isEditing && editRoot) {
+      body = editorCodeTextarea.value;
+    } else if (isEditing && editRoot) {
       const clone = editRoot.cloneNode(true) as HTMLElement;
       if (hasChangeMarkers(clone)) stripChangeMarkers(clone);
       stripReviewHighlights(clone);
-      return htmlFragmentToMarkdown(htmlFromEditRootForMarkdown(clone));
+      body = htmlFragmentToMarkdown(htmlFromEditRootForMarkdown(clone));
+    } else {
+      body = currentMd;
     }
-    return currentMd;
+    return mergeHiddenDocumentPrefix(hiddenDocumentPrefix, body);
+  }
+
+  function syncHiddenPrefixFromMarkdown(md: string): void {
+    hiddenDocumentPrefix = extractHiddenDocumentPrefix(md);
+  }
+
+  /** Zorg dat Files/ de actuele editor-inhoud heeft vóór agent-calls (0-bytes/draft-fix). */
+  async function ensureDocumentPersistedBeforeAgent(docName: string, isExternal: boolean): Promise<void> {
+    if (isExternal || !docName) return;
+    await flushAutoSave();
+    const body = getMarkdownForExport();
+    const hasVisible = stripHiddenDocumentPrefix(body).trim().length > 0;
+    if (!hasVisible && !hiddenDocumentPrefix.trim() && !isWorkDraftPath(docName)) return;
+    try {
+      const saved = await saveMarkdownFile(docName, body);
+      await followCorpusDocumentMove(docName, saved);
+      currentMd = body;
+      syncHiddenPrefixFromMarkdown(body);
+      isDirty = false;
+    } catch (e) {
+      status.textContent = `Opslaan vóór Nexus mislukt: ${String((e as Error).message)}`;
+      throw e;
+    }
   }
 
   async function revertEditorToCurrentMd() {
@@ -3610,7 +5567,7 @@ ${transcript}`;
     } else if (agentChatRequestBusy) {
       agentSidebarBusyText.textContent = "Even geduld (chat)…";
     } else if (sidebarReviewBusy) {
-      agentSidebarBusyText.textContent = "Agent verwerkt opmerkingen…";
+      agentSidebarBusyText.textContent = "Nexus verwerkt opmerkingen…";
     }
   }
 
@@ -3625,17 +5582,17 @@ ${transcript}`;
     agentChatNewBtn.disabled = dis;
     agentChatRenameBtn.disabled = dis || !activeAgentChatId;
     agentChatDeleteBtn.disabled = dis || agentChatSessions.length <= 1;
+    agentChatSummarizeBtn.disabled = dis || !activeAgentChatId || agentChatHistory.length < 12;
     agentChatPromoteBtn.disabled = dis || !activeAgentChatId;
     agentChatPromoteStaleBtn.disabled = dis;
     agentMemoryToggleBtn.disabled = dis;
     agentCorpusRefreshBtn.disabled = dis;
     agentSecondBrainBtn.disabled = dis;
     agentAskToAgentBtn.disabled = dis || !lastAskAssistantReply();
+    nexusExecuteOnActiveBtn.disabled = dis || !nexusActiveObjectAvailable();
     promptMacroBtn.disabled = dis;
     meetingReportBtn.disabled = dis;
     agentChatMicBtn.disabled = dis || !agentSpeechRecognitionAvailable;
-    agentCorpusWideCheckbox.disabled = dis;
-    agentWebSearchCheckbox.disabled = dis;
     if (dis) stopAgentChatSpeech();
   }
 
@@ -3651,6 +5608,56 @@ ${transcript}`;
 
   function normalizeAgentChatHistoryForUi(messages: AgentChatTurn[]): AgentChatTurn[] {
     return trimAgentChatHistoryForUi(messages.map((m) => ({ role: m.role, content: m.content, ...(m.mode ? { mode: m.mode } : {}) })));
+  }
+
+  function agentChatTurnSignature(turn: AgentChatTurn): string {
+    return `${turn.role}\0${turn.mode || ""}\0${turn.content}`;
+  }
+
+  /** Voeg document-specifieke agent-chatturns toe aan de actieve Nexus-sessie (zonder duplicaten). */
+  function syncDocumentChatToSession(documentUiHistory: AgentChatTurn[]): void {
+    const normalized = normalizeAgentChatHistoryForUi(documentUiHistory);
+    if (!normalized.length) return;
+    const existing = new Set(agentChatHistory.map((turn) => agentChatTurnSignature(turn)));
+    for (const turn of normalized) {
+      const sig = agentChatTurnSignature(turn);
+      if (existing.has(sig)) continue;
+      agentChatHistory.push(turn);
+      existing.add(sig);
+    }
+    agentChatHistory = trimAgentChatHistoryForUi(agentChatHistory);
+  }
+
+  function agentChatHistoryChars(messages: AgentChatTurn[]): number {
+    return messages.reduce((sum, m) => sum + String(m.content || "").length, 0);
+  }
+
+  function shouldAutoSummarizeAgentChat(nextMessage = ""): boolean {
+    if (!activeAgentChatId) return false;
+    if (agentChatHistory.length <= AUTO_SUMMARIZE_KEEP_RECENT_TURNS + 2) return false;
+    if (agentChatHistory.length < AUTO_SUMMARIZE_CHAT_MIN_MESSAGES) {
+      return agentChatHistoryChars(agentChatHistory) + nextMessage.length >= AUTO_SUMMARIZE_CHAT_MIN_CHARS;
+    }
+    return true;
+  }
+
+  async function autoSummarizeAgentChatIfNeeded(nextMessage = ""): Promise<boolean> {
+    if (!shouldAutoSummarizeAgentChat(nextMessage)) return false;
+    setAgentChatRequestBusy(true);
+    status.textContent = "Nexus compacteert automatisch de chatcontext om tokens te besparen…";
+    try {
+      const result = await summarizeAgentChatSession(activeAgentChatId, {
+        keepRecentTurns: AUTO_SUMMARIZE_KEEP_RECENT_TURNS,
+      });
+      applyAgentChatSessionsPayload(result);
+      status.textContent = `Chat automatisch samengevat: ${result.summarizedMessages || 0} oude bericht(en) vervangen.`;
+      return true;
+    } catch (e) {
+      status.textContent = `Automatisch chat samenvatten mislukt; Nexus probeert door te gaan met huidige context (${String((e as Error).message || e)}).`;
+      return false;
+    } finally {
+      setAgentChatRequestBusy(false);
+    }
   }
 
   function activeAgentChatSession(): AgentChatSession | null {
@@ -3681,6 +5688,7 @@ ${transcript}`;
     }
     agentChatSessionSelect.value = selected;
     agentChatDeleteBtn.disabled = agentChatRequestBusy || sidebarReviewBusy || agentChatSessions.length <= 1;
+    agentChatSummarizeBtn.disabled = agentChatRequestBusy || sidebarReviewBusy || !activeAgentChatId || agentChatHistory.length < 12;
     agentChatPromoteBtn.disabled = agentChatRequestBusy || sidebarReviewBusy || !activeAgentChatId;
     agentChatPromoteStaleBtn.disabled = agentChatRequestBusy || sidebarReviewBusy;
     agentCorpusRefreshBtn.disabled = agentChatRequestBusy || sidebarReviewBusy;
@@ -3714,9 +5722,9 @@ ${transcript}`;
     try {
       pendingMemoryActions = [];
       revertibleMemoryActions = [];
+      clearAgentChatActivityStrip();
       applyAgentChatSessionsPayload(await createAgentChatSession());
       hideAgentChatLlmDebug();
-      clearAgentChatActivityStrip();
     } catch (e) {
       status.textContent = `Nieuwe chat starten mislukt: ${String((e as Error).message)}`;
     }
@@ -3727,6 +5735,7 @@ ${transcript}`;
     if (!session) return;
     pendingMemoryActions = [];
     revertibleMemoryActions = [];
+    clearAgentChatActivityStrip();
     activeAgentChatId = id;
     agentChatHistory = normalizeAgentChatHistoryForUi(session.messages);
     syncAgentChatSessionUi();
@@ -3755,9 +5764,9 @@ ${transcript}`;
     try {
       pendingMemoryActions = [];
       revertibleMemoryActions = [];
+      clearAgentChatActivityStrip();
       applyAgentChatSessionsPayload(await deleteAgentChatSession(activeAgentChatId));
       hideAgentChatLlmDebug();
-      clearAgentChatActivityStrip();
     } catch (e) {
       status.textContent = `Chat verwijderen mislukt: ${String((e as Error).message)}`;
     }
@@ -3766,11 +5775,11 @@ ${transcript}`;
   async function renderMemoryPanel(): Promise<void> {
     agentMemoryPanel.hidden = !memoryPanelVisible;
     if (!memoryPanelVisible) return;
-    agentMemoryPanel.replaceChildren(el("div", "mv-agent-memory-panel-title", "Agent long-term memory laden…"));
+    agentMemoryPanel.replaceChildren(el("div", "mv-agent-memory-panel-title", "Nexus long-term memory laden…"));
     try {
       const idx = await fetchMemoryIndex();
       memoryMarkdownPaths = idx.files;
-      const title = el("div", "mv-agent-memory-panel-title", `Agent memory (${idx.files.length})`);
+      const title = el("div", "mv-agent-memory-panel-title", `Nexus memory (${idx.files.length})`);
       const hint = el(
         "div",
         "mv-agent-memory-panel-hint",
@@ -3800,7 +5809,7 @@ ${transcript}`;
       agentMemoryPanel.replaceChildren(title, hint, list);
     } catch (e) {
       agentMemoryPanel.replaceChildren(
-        el("div", "mv-agent-memory-panel-title", "Agent memory"),
+        el("div", "mv-agent-memory-panel-title", "Nexus memory"),
         el("div", "mv-agent-memory-panel-hint", `Memory laden mislukt: ${String((e as Error).message)}`),
       );
     }
@@ -3821,6 +5830,25 @@ ${transcript}`;
     } finally {
       setAgentChatRequestBusy(false);
       rerenderAgentChatMessages();
+    }
+  }
+
+  async function summarizeActiveChat(): Promise<void> {
+    if (!activeAgentChatId) return;
+    if (agentChatHistory.length < 12) {
+      status.textContent = "Chat is nog kort; samenvatten bespaart nu weinig tokens.";
+      return;
+    }
+    if (!confirm("Actieve chat compact samenvatten? Oude berichten worden vervangen door één voortzettingssamenvatting plus recente context.")) return;
+    setAgentChatRequestBusy(true);
+    try {
+      const result = await summarizeAgentChatSession(activeAgentChatId, { keepRecentTurns: 8 });
+      applyAgentChatSessionsPayload(result);
+      status.textContent = `Chat samengevat: ${result.summarizedMessages || 0} bericht(en) vervangen, ${result.keptMessages || 0} recente bericht(en) behouden.`;
+    } catch (e) {
+      status.textContent = `Chat samenvatten mislukt: ${String((e as Error).message || e)}`;
+    } finally {
+      setAgentChatRequestBusy(false);
     }
   }
 
@@ -3918,19 +5946,19 @@ ${transcript}`;
   function prepareLastAskReplyForAgent(): void {
     const reply = lastAskAssistantReply();
     if (!reply) {
-      status.textContent = "Geen eerder Ask-antwoord gevonden om als Agent-instructie te gebruiken.";
+      status.textContent = "Geen eerder Nexus-antwoord gevonden om als reviewvoorstel te gebruiken.";
       return;
     }
     agentChatMode = "agent";
     refreshAgentChatModeUi();
     const targetHint = fileSelect.value && fileSelect.value !== EXTERNAL_MARKDOWN_VALUE ? ` in \`${fileSelect.value}\`` : "";
     agentChatInput.value =
-      `Gebruik het laatste Ask-resultaat hieronder als definitieve inhoud en verwerk dit reviewbaar${targetHint}.\n\n` +
+      `Gebruik het laatste Nexus-resultaat hieronder als definitieve inhoud en verwerk dit reviewbaar${targetHint}.\n\n` +
       `Plaats of vervang alleen de relevante sectie. Maak exacte find/replace-patches en behoud de rest van het document.\n\n` +
-      `Laatste Ask-resultaat:\n\n${reply}`;
+      `Laatste Nexus-resultaat:\n\n${reply}`;
     agentChatInput.focus();
     agentChatInput.setSelectionRange(agentChatInput.value.length, agentChatInput.value.length);
-    status.textContent = "Laatste Ask-antwoord staat klaar als Agent-instructie.";
+    status.textContent = "Laatste Nexus-antwoord staat klaar als reviewvoorstel.";
     syncAgentChatDisabled();
   }
 
@@ -4158,27 +6186,25 @@ ${transcript}`;
   }
 
   function refreshAgentChatModeUi() {
-    const isAgent = agentChatMode === "agent";
-    agentModeAgentBtn.classList.toggle("mv-agent-chat-mode--active", isAgent);
-    agentModeAskBtn.classList.toggle("mv-agent-chat-mode--active", !isAgent);
-    agentModeAgentBtn.setAttribute("aria-pressed", isAgent ? "true" : "false");
-    agentModeAskBtn.setAttribute("aria-pressed", isAgent ? "false" : "true");
-    agentCorpusWideRow.hidden = isAgent || !commentSelectionHost.hidden;
-    agentWebSearchRow.hidden = isAgent || !commentSelectionHost.hidden;
+    refreshNexusExecuteOnActiveUi();
+    refreshAgentChatContextUi();
     if (!commentSelectionHost.hidden) {
       agentChatInput.placeholder =
-        "Wat moet de agent met deze selectie doen? Verzend start de agent direct.";
+        "Wat moet Nexus met deze selectie doen? Verzend maakt een reviewvoorstel.";
       return;
     }
-    agentChatInput.placeholder = isAgent
-      ? "Opdracht of vraag. Optioneel: selecteer in de tekst voor extra context…"
-      : agentCorpusWideCheckbox.checked && agentWebSearchCheckbox.checked
-        ? "Vraag over Files en/of actuele internetinformatie…"
-        : agentCorpusWideCheckbox.checked
-        ? "Vraag over alle Markdown-bestanden in Files (corpus-index onder .mv-index)…"
-        : agentWebSearchCheckbox.checked
-          ? "Vraag met internetzoekfunctie via Tavily; het document is alleen context…"
-        : "Vraag over het geopende document; er worden geen automatische wijzigingen gedaan…";
+    if (nexusExecuteOnActiveObject && nexusActiveObjectAvailable()) {
+      if (activeMainAppView === "email") {
+        agentChatInput.placeholder = "Opdracht voor uitvoerbare acties op deze e-mail…";
+      } else if (activeMainAppView === "kanban") {
+        agentChatInput.placeholder = "Opdracht voor uitvoerbare acties op deze taak…";
+      } else {
+        agentChatInput.placeholder = "Opdracht voor een reviewvoorstel/wijziging in dit document…";
+      }
+    } else {
+      agentChatInput.placeholder =
+        "Vraag iets of geef een opdracht. Nexus bepaalt uit de context of er acties nodig zijn…";
+    }
     rerenderAgentChatMessages();
   }
 
@@ -4190,16 +6216,11 @@ ${transcript}`;
       body.textContent = m.content;
       return;
     }
-    if (agentReplyMarkdownCheckbox.checked) {
-      body.classList.add("mv-agent-chat-msg-body--md");
-      const inner = el("div", "mv-prose mv-agent-chat-md-prose");
-      inner.innerHTML = renderMarkdown(m.content).html;
-      linkifyAgentMarkdownReferences(inner);
-      body.append(inner);
-    } else {
-      body.classList.add("mv-agent-chat-msg-body--plain");
-      fillPlainAgentTextWithMarkdownLinks(body, m.content);
-    }
+    body.classList.add("mv-agent-chat-msg-body--md");
+    const inner = el("div", "mv-prose mv-agent-chat-md-prose");
+    inner.innerHTML = renderMarkdown(m.content).html;
+    linkifyAgentMarkdownReferences(inner);
+    body.append(inner);
   }
 
   function createAgentChatBubble(m: AgentChatTurn): HTMLElement {
@@ -4210,7 +6231,47 @@ ${transcript}`;
     const body = el("div", "mv-agent-chat-msg-body");
     fillAgentChatMsgBody(body, m);
     wrap.append(body);
+    if (m.role === "assistant" && nexusSpeechSupported() && m.content.trim()) {
+      const actions = el("div", "mv-agent-chat-msg-actions");
+      const speakBtn = el("button", "mv-agent-chat-speak mv-ribbon-btn mv-ribbon-btn--ghost");
+      speakBtn.type = "button";
+      speakBtn.setAttribute("aria-label", "Nexus-antwoord voorlezen");
+      speakBtn.title = "Voorlezen (Nederlands)";
+      speakBtn.textContent = "▶";
+      speakBtn.addEventListener("click", () => {
+        speakNexusReply(m.content);
+      });
+      actions.append(speakBtn);
+      wrap.append(actions);
+    }
     return wrap;
+  }
+
+  function createAgentChatActivityInlineBlock(): HTMLElement {
+    const box = el("div", "mv-agent-chat-activity-inline");
+    box.setAttribute("aria-live", "polite");
+    box.setAttribute("aria-label", "Activiteiten van de agent");
+    for (const item of agentChatInlineActivities) {
+      const row = el(
+        "div",
+        item.metrics
+          ? "mv-agent-chat-activity-row mv-agent-chat-activity-row--metrics"
+          : item.model
+            ? "mv-agent-chat-activity-row mv-agent-chat-activity-row--model"
+            : "mv-agent-chat-activity-row",
+      );
+      const dot = el("span", "mv-agent-chat-activity-dot");
+      const tx = el("span", "mv-agent-chat-activity-text", item.line);
+      row.append(dot, tx);
+      box.append(row);
+    }
+    return box;
+  }
+
+  function appendAgentChatInlineActivitiesIfNeeded(insertBeforeIndex: number): void {
+    if (!agentChatInlineActivities.length || agentChatActivityAnchorIndex === null) return;
+    if (insertBeforeIndex !== agentChatActivityAnchorIndex + 1) return;
+    agentChatMessages.append(createAgentChatActivityInlineBlock());
   }
 
   function memoryActionLabel(action: AgentMemoryAction): string {
@@ -4255,7 +6316,7 @@ ${transcript}`;
       await refreshAfterMemoryActions(result.executedMemoryActions, result.corpusCreatedPaths);
       status.textContent = result.errors.length
         ? `Geheugen deels toegepast (${result.errors.length} fout(en)).`
-        : `Wijziging doorgevoerd via tijdelijke Agent-modus: ${result.executedMemoryActions.length}.`;
+        : `Nexus-geheugenwijziging doorgevoerd: ${result.executedMemoryActions.length}.`;
     } catch (e) {
       status.textContent = `Geheugenactie toepassen mislukt: ${String((e as Error).message)}`;
     } finally {
@@ -4315,7 +6376,7 @@ ${transcript}`;
     const hint = el(
       "div",
       "mv-agent-memory-actions-hint",
-      "Ask mag niet zelf schrijven. Voor toepassen schakelt de app tijdelijk naar Agent-modus.",
+      "Nexus past geheugenwijzigingen pas toe nadat je ze hier expliciet goedkeurt.",
     );
     const list = el("ul", "mv-agent-memory-actions-list");
     for (const action of pendingMemoryActions) {
@@ -4369,7 +6430,7 @@ ${transcript}`;
     const hint = el(
       "div",
       "mv-agent-memory-actions-hint",
-      "Ask heeft de wijziging direct toegepast. Kies Niet akkoord om de wijziging terug te draaien.",
+      "Nexus heeft de geheugenwijziging toegepast. Kies Niet akkoord om de wijziging terug te draaien.",
     );
     const list = el("ul", "mv-agent-memory-actions-list");
     for (const action of revertibleMemoryActions) {
@@ -4412,7 +6473,7 @@ ${transcript}`;
 
   function rerenderAgentChatMessages() {
     agentChatMessages.replaceChildren();
-    const pending = agentChatMode === "agent" && reviewComments.some(lastReplyIsFromAgent) && isEditing;
+    const pending = reviewComments.some(lastReplyIsFromAgent) && isEditing;
     let lastAssistantIdx = -1;
     for (let i = agentChatHistory.length - 1; i >= 0; i--) {
       if (agentChatHistory[i].role === "assistant") {
@@ -4422,9 +6483,15 @@ ${transcript}`;
     }
     const decisionDisabled = agentChatRequestBusy;
     for (let i = 0; i < agentChatHistory.length; i++) {
+      appendAgentChatInlineActivitiesIfNeeded(i);
       const m = agentChatHistory[i];
       const wrap = createAgentChatBubble(m);
       const showDecision = pending && m.role === "assistant" && i === lastAssistantIdx;
+      const showDocOffer =
+        pendingDocumentEditOffer &&
+        m.role === "assistant" &&
+        i === pendingDocumentEditOffer.assistantIndex &&
+        !showDecision;
       if (showDecision) {
         const decision = el("div", "mv-agent-chat-msg-decision");
         const row = el("div", "mv-agent-chat-msg-decision-row");
@@ -4449,9 +6516,12 @@ ${transcript}`;
         row.append(approveBtn, rejectBtn);
         decision.append(hint, row);
         wrap.append(decision);
+      } else if (showDocOffer && pendingDocumentEditOffer) {
+        wrap.append(createDocumentEditOfferBlock(pendingDocumentEditOffer.userMessage));
       }
       agentChatMessages.append(wrap);
     }
+    appendAgentChatInlineActivitiesIfNeeded(agentChatHistory.length);
     if (pending && lastAssistantIdx < 0) {
       const stub = el("div", "mv-agent-chat-msg mv-agent-chat-msg--assistant mv-agent-chat-msg--decision-only");
       const body = el("div", "mv-agent-chat-msg-body mv-agent-chat-msg-body--plain");
@@ -4477,21 +6547,22 @@ ${transcript}`;
         agentSidebarScroll.scrollTop = agentSidebarScroll.scrollHeight;
       });
     });
-    if (agentReplyMarkdownCheckbox.checked) {
-      void Promise.all([runMermaidInRoot(agentChatMessages), runChartJsInRoot(agentChatMessages)]);
-    }
+    void Promise.all([runMermaidInRoot(agentChatMessages), runChartJsInRoot(agentChatMessages)]);
   }
 
   function applyReviewPack(pack: { comments: ReviewComment[]; agentChatUiHistory: AgentChatTurn[] }) {
     reviewComments = pack.comments;
+    syncDocumentChatToSession(pack.agentChatUiHistory);
     rerenderAgentChatMessages();
   }
 
   function clearAgentChat() {
     stopAgentChatSpeech();
+    stopNexusSpeech();
     agentChatHistory = [];
     pendingMemoryActions = [];
     revertibleMemoryActions = [];
+    clearPendingDocumentEditOffer();
     hideAgentChatLlmDebug();
     clearAgentChatActivityStrip();
     rerenderAgentChatMessages();
@@ -4506,6 +6577,37 @@ ${transcript}`;
     if (!v) return null;
     if (v === EXTERNAL_MARKDOWN_VALUE) return getOrCreateExternalAgentVirtualName();
     return v;
+  }
+
+  function getOpenDocumentContextForNexus(): {
+    path: string;
+    label: string;
+    markdown: string;
+  } | null {
+    const path = getAgentChatDocumentName();
+    if (!path) return null;
+    let label = path;
+    if (fileSelect.value === EXTERNAL_MARKDOWN_VALUE) {
+      const ext = externalFileLabel.trim();
+      if (ext) label = ext;
+      else if (externalConfluencePage?.title) label = externalConfluencePage.title;
+    }
+    return { path, label, markdown: getMarkdownForExport() };
+  }
+
+  function refreshAgentChatContextUi(): void {
+    const openDoc = getOpenDocumentContextForNexus();
+    if (!openDoc) {
+      agentChatContextLine.textContent = "Geen document open in viewer";
+      agentChatContextLine.title = "";
+      return;
+    }
+    const short =
+      openDoc.label !== openDoc.path
+        ? `${openDoc.label} · ${openDoc.path}`
+        : openDoc.path;
+    agentChatContextLine.textContent = `Open: ${short}`;
+    agentChatContextLine.title = openDoc.path;
   }
 
   async function applyViewerActions(actions: ViewerAgentAction[] | undefined): Promise<void> {
@@ -4534,8 +6636,214 @@ ${transcript}`;
     }
   }
 
+  function activeEmailAgentNotification(): EmailAgentNotification | null {
+    if (!emailAgentSelectedNotificationId) return null;
+    return emailAgentNotifications.find((notification) => notification.id === emailAgentSelectedNotificationId) || null;
+  }
+
+  function activeKanbanTask(): KanbanTask | null {
+    return kanbanSelectedTaskId ? kanbanTaskById(kanbanSelectedTaskId) : null;
+  }
+
+  function nexusEmailContextBlock(notification: EmailAgentNotification): string {
+    return [
+      "## Actieve e-mailfollow-up",
+      `- id: ${notification.id}`,
+      `- status: ${notification.status}`,
+      `- prioriteit: ${notification.priority}`,
+      `- richting/map: ${notification.direction} / ${notification.folder}`,
+      `- onderwerp: ${notification.subject || "(geen onderwerp)"}`,
+      `- titel: ${notification.title || "(geen titel)"}`,
+      `- van: ${notification.from || "(onbekend)"}`,
+      `- aan: ${notification.to || "(onbekend)"}`,
+      `- datum: ${notification.mailDate || notification.createdAt || "(onbekend)"}`,
+      `- memoryPath: ${notification.memoryPath || "(geen)"}`,
+      `- gekoppelde kanbanTaskId: ${notification.kanbanTaskId || "(geen)"}`,
+      `- tags: ${notification.tags.join(", ") || "(geen)"}`,
+      "",
+      "### Samenvatting",
+      notification.summary || "(geen samenvatting)",
+      "",
+      "### Waarom belangrijk",
+      notification.importanceReason || "(niet vastgelegd)",
+      "",
+      "### Voorgestelde actie",
+      notification.action || "(geen actie vastgelegd)",
+      "",
+      "### Context van Joost",
+      notification.userContext || notification.processedUserContext || "(geen extra context)",
+    ].join("\n");
+  }
+
+  function nexusKanbanContextBlock(task: KanbanTask): string {
+    const sourceLines = task.sourceRefs
+      .slice(0, 12)
+      .map((ref) =>
+        [
+          `- ${ref.type}: ${ref.label}`,
+          ref.entryId ? `entryId=${ref.entryId}` : "",
+          ref.notificationId ? `notificationId=${ref.notificationId}` : "",
+          ref.path ? `path=${ref.path}` : "",
+          ref.timestamp ? `timestamp=${ref.timestamp}` : "",
+        ]
+          .filter(Boolean)
+          .join(" · "),
+      )
+      .join("\n");
+    const historyLines = task.history
+      .slice(-10)
+      .map((entry) => `- ${entry.ts} · ${entry.actor} · ${entry.event}: ${entry.note}`)
+      .join("\n");
+    const commentLines =
+      kanbanDetailCommentsTaskId === task.id
+        ? kanbanDetailComments
+            .slice(-8)
+            .flatMap((thread) => {
+              const lines = [`- [${thread.author}] ${thread.body.slice(0, 320)}`];
+              for (const reply of thread.replies.slice(-4)) {
+                lines.push(`  - [${reply.author}] ${reply.body.slice(0, 220)}`);
+              }
+              return lines;
+            })
+            .join("\n")
+        : "";
+    return [
+      "## Actieve Kanban-taak",
+      `- id: ${task.id}`,
+      `- titel: ${task.title}`,
+      `- status: ${KANBAN_STATUS_LABELS[task.status] || task.status}`,
+      `- prioriteit: ${task.priority}`,
+      `- project: ${task.project || "(geen)"}`,
+      `- personen: ${task.people.join(", ") || "(geen)"}`,
+      `- deadline: ${task.dueDate || "(geen)"}`,
+      `- next action: ${task.nextAction || "(geen)"}`,
+      "",
+      "### Samenvatting",
+      task.summary || "(geen samenvatting)",
+      "",
+      "### Bronnen",
+      sourceLines || "(geen bronnen)",
+      "",
+      "### Commentaren",
+      commentLines || "(open taakdetail voor actuele discussies)",
+      "",
+      "### Historie",
+      historyLines || "(geen historie)",
+    ].join("\n");
+  }
+
+  function buildNexusContextualMessage(message: string): {
+    message: string;
+    contextLabel: string;
+    name: string;
+  } {
+    if (activeMainAppView === "email") {
+      const notification = activeEmailAgentNotification();
+      if (!notification) return { message, contextLabel: "e-mailagent", name: "email-agent" };
+      return {
+        message: [
+          "Je beantwoordt deze vraag in de context van de actieve e-mailfollow-up in de E-mailagent-weergave.",
+          "Gebruik deze e-mailcontext als primaire gespreksonderwerp. Als je een antwoord opstelt: maak hooguit een Outlook-concept en verzend niets zonder expliciete opdracht.",
+          "Als Joost aanvullende context, een correctie of opvolginstructie voor deze e-mail geeft, verwerk die via de tool update_email_followup_context met het id uit de e-mailcontext.",
+          "",
+          nexusEmailContextBlock(notification),
+          "",
+          "## Vraag of opdracht van Joost",
+          message,
+        ].join("\n"),
+        contextLabel: "e-mailfollow-up",
+        name: `email-followup:${notification.id}`,
+      };
+    }
+    if (activeMainAppView === "kanban") {
+      const task = activeKanbanTask();
+      if (!task) return { message, contextLabel: "kanban", name: "kanban" };
+      return {
+        message: [
+          "Je beantwoordt deze vraag in de context van de actieve Kanban-taak in de Kanban-weergave.",
+          "Gebruik deze taakcontext als primaire gespreksonderwerp. Als je acties uitvoert, werk waar passend de Kanban-taak bij met de beschikbare tools.",
+          "",
+          nexusKanbanContextBlock(task),
+          "",
+          "## Vraag of opdracht van Joost",
+          message,
+        ].join("\n"),
+        contextLabel: "Kanban-taak",
+        name: `kanban-task:${task.id}`,
+      };
+    }
+    return { message, contextLabel: "document", name: getAgentChatDocumentName() ?? "" };
+  }
+
+  async function reportCurrentNexusIssue(): Promise<void> {
+    if (agentChatRequestBusy || sidebarReviewBusy) return;
+    const issueText = window.prompt(
+      "Welke fout of onvolkomenheid moet Nexus voor Cursor vastleggen?",
+      "Nexus gaf niet het gewenste resultaat. Leg de foutmelding, context en gewenste vervolgstap vast.",
+    );
+    if (!issueText?.trim()) return;
+    nexusReportIssueBtn.disabled = true;
+    try {
+      const contextual = buildNexusContextualMessage(issueText.trim());
+      const lastAssistant = [...agentChatHistory].reverse().find((m) => m.role === "assistant")?.content || "";
+      const payload = await appendNexusErrorLog({
+        title: "Door gebruiker gemelde Nexus-onvolkomenheid",
+        component: `frontend:${activeMainAppView}`,
+        command: contextual.message.slice(0, 3000),
+        error: issueText.trim(),
+        context: contextual.contextLabel,
+        detail: {
+          activeView: activeMainAppView,
+          documentName: getAgentChatDocumentName() || "",
+          chatId: activeAgentChatId || "",
+          lastAssistant: lastAssistant.slice(0, 3000),
+        },
+      });
+      status.textContent = payload.path
+        ? `Probleem vastgelegd in ${payload.path}.`
+        : "Probleem vastgelegd in Nexus errorlog.";
+    } catch (e) {
+      status.textContent = `Probleem vastleggen mislukt: ${String((e as Error).message || e)}`;
+    } finally {
+      nexusReportIssueBtn.disabled = false;
+    }
+  }
+
+  async function prepareNexusFixlogVerification(): Promise<void> {
+    if (agentChatRequestBusy || sidebarReviewBusy) return;
+    nexusVerifyFixlogBtn.disabled = true;
+    try {
+      const logs = await fetchNexusDebugLogs("both");
+      const fixPath = logs.fix?.path || "Files/.nexus-debug/fixlog.md";
+      const errorPath = logs.error?.path || "Files/.nexus-debug/errorlog.md";
+      const prompt = [
+        "Lees de Nexus fixlog en voer de open verificatie-instructies uit.",
+        "",
+        `Fixlog: ${fixPath}`,
+        `Errorlog: ${errorPath}`,
+        "",
+        "Werkwijze:",
+        "1. Gebruik read_nexus_debug_logs om de actuele fixlog en errorlog te lezen.",
+        "2. Benoem expliciet welke verificatie je gaat uitvoeren en welke tools je daarvoor gebruikt.",
+        "3. Voer de verificatie uit met beschikbare Nexus-tools.",
+        "4. Schrijf elke teststap, waarneming en eventuele resterende fout terug via append_nexus_error_log.",
+        "5. Sluit af met een korte conclusie: opgelost, deels opgelost of niet opgelost.",
+        "",
+        "Toon in je antwoord de uitgevoerde acties en bevindingen expliciet.",
+      ].join("\n");
+      agentChatInput.value = agentChatInput.value.trim() ? `${agentChatInput.value.trim()}\n\n${prompt}` : prompt;
+      agentChatInput.focus();
+      status.textContent = "Fixlog-verificatieprompt staat klaar voor Nexus.";
+    } catch (e) {
+      status.textContent = `Fixlog lezen mislukt: ${String((e as Error).message || e)}`;
+    } finally {
+      nexusVerifyFixlogBtn.disabled = false;
+    }
+  }
+
   async function submitAgentChat() {
     stopAgentChatSpeech();
+    stopNexusSpeech();
     const text = agentChatInput.value.trim();
     if (!text) return;
     if (agentChatRequestBusy || sidebarReviewBusy) return;
@@ -4558,7 +6866,7 @@ ${transcript}`;
       }
       const nameEarly = fileSelect.value;
       const isExternalEarly = nameEarly === EXTERNAL_MARKDOWN_VALUE;
-      if (!isExternalEarly) await flushAutoSave();
+      if (!isExternalEarly) await ensureDocumentPersistedBeforeAgent(docNameEarly, isExternalEarly);
 
       try {
         const cfgEarly = await fetchAgentConfig();
@@ -4601,6 +6909,14 @@ ${transcript}`;
         return;
       }
 
+      if (!activeAgentChatId) {
+        await createNewAgentChat();
+        if (!activeAgentChatId) return;
+      }
+      agentChatHistory.push({ role: "user", content: text, mode: "agent" });
+      beginAgentChatActivityStream(agentChatHistory.length - 1);
+      rerenderAgentChatMessages();
+
       refreshAgentPendingDecisionUi();
       editRoot.dispatchEvent(new Event("input", { bubbles: true }));
       refreshRibbonState();
@@ -4608,16 +6924,52 @@ ${transcript}`;
       return;
     }
 
-    const mode = agentChatMode;
+    const macroRun = pendingPromptMacroRun;
+    pendingPromptMacroRun = null;
+    clearPendingDocumentEditOffer();
+
     const docName = getAgentChatDocumentName();
+    const openDoc = getOpenDocumentContextForNexus();
+    const nexusContext = buildNexusContextualMessage(text);
+    const executeOnActive = nexusExecuteOnActiveObject && nexusActiveObjectAvailable() && !macroRun;
+    let mode: AgentChatMode = macroRun
+      ? macroRun.mode
+      : inferNexusChatMode(text, { activeView: activeMainAppView, hasDocument: !!docName });
+    if (executeOnActive && activeMainAppView === "documents" && docName) {
+      mode = "agent";
+    }
+    agentChatMode = mode;
     const isExternal = fileSelect.value === EXTERNAL_MARKDOWN_VALUE;
+
+    if (
+      mode === "ask" &&
+      !executeOnActive &&
+      activeMainAppView === "documents" &&
+      docName &&
+      shouldOfferDocumentEditMode(text, { activeView: activeMainAppView, hasDocument: true }, "", {
+        executeOnActive,
+      })
+    ) {
+      highlightNexusExecuteOnActiveBtn();
+      status.textContent =
+        "Tip: voor wijzigingen in het document kun je Wijzig document aanzetten vóór je verzendt.";
+    }
 
     if (mode === "agent") {
       if (!docName) {
-        status.textContent = "Selecteer of open eerst een document voor agent-modus.";
+        status.textContent = "Selecteer of open eerst een document voor een reviewvoorstel.";
         return;
       }
-      if (!isExternal) await flushAutoSave();
+      if (!isExternal) await ensureDocumentPersistedBeforeAgent(docName, isExternal);
+    }
+
+    if (executeOnActive && activeMainAppView === "email" && !activeEmailAgentNotification()) {
+      status.textContent = "Selecteer eerst een e-mail voor uitvoerbare acties.";
+      return;
+    }
+    if (executeOnActive && activeMainAppView === "kanban" && !activeKanbanTask()) {
+      status.textContent = "Selecteer eerst een Kanban-taak voor uitvoerbare acties.";
+      return;
     }
 
     try {
@@ -4637,16 +6989,20 @@ ${transcript}`;
       if (!activeAgentChatId) return;
     }
 
+    await autoSummarizeAgentChatIfNeeded(text);
+
     agentChatInput.value = "";
     agentChatHistory = trimAgentChatHistoryForUi(agentChatHistory);
     agentChatHistory.push({ role: "user", content: text, mode });
+    beginAgentChatActivityStream(agentChatHistory.length - 1);
     const submittedHistory = agentChatHistory.slice();
     rerenderAgentChatMessages();
 
     setAgentChatRequestBusy(true);
     let assistantText = "";
+    let chatRes: Awaited<ReturnType<typeof agentChat>> | undefined;
     try {
-      const md = getMarkdownForExport();
+      const md = openDoc?.markdown ?? (activeMainAppView === "documents" ? getMarkdownForExport() : "");
       const prior = submittedHistory.slice(0, -1);
       let selectionArg: { quote: string; prefix: string; suffix: string } | undefined;
       if (mode === "agent" && editRoot) {
@@ -4665,40 +7021,66 @@ ${transcript}`;
           }
         }
       }
-      const askCorpus = mode === "ask" && agentCorpusWideCheckbox.checked;
-      const askWebSearch = mode === "ask" && agentWebSearchCheckbox.checked;
-      const askTools = askCorpus || askWebSearch;
+      const nexusToolsEnabled = true;
+      const askCorpus = true;
+      const askWebSearch = macroRun?.id === "weekplan-2ndbrain" ? false : true;
+      const askTools = nexusToolsEnabled;
       const activeSessionForActivity = activeAgentChatSession();
-      if (askTools) clearAgentChatActivityStrip();
-      const res = await agentChat(
-        {
-          mode,
-          message: text,
-          markdown: md,
-          chatId: activeAgentChatId,
-          chatTitle: activeSessionForActivity?.title || "",
-          name: docName ?? "",
-          history: prior.slice(-MAX_AGENT_CHAT_HISTORY),
-          debugLlm: readAgentDebugLlm(),
-          replyMarkdown: agentReplyMarkdownCheckbox.checked,
-          ...(selectionArg ? { selection: selectionArg } : {}),
-          ...(askTools
-            ? {
-                ...(askCorpus ? { corpusWide: true } : {}),
-                ...(askWebSearch ? { webSearch: true } : {}),
-                activityStream: true,
-              }
-            : {}),
-        },
-        askTools ? { onCorpusActivity: (ev) => pushCorpusActivityRow(ev) } : undefined,
-      );
+      try {
+        chatRes = await agentChat(
+          {
+            mode,
+            message: nexusContext.message,
+            markdown: md,
+            chatId: activeAgentChatId,
+            chatTitle: activeSessionForActivity?.title || "",
+            name: activeMainAppView === "documents" ? (docName ?? "") : nexusContext.name,
+            activeView: activeMainAppView,
+            ...(openDoc
+              ? {
+                  openDocumentPath: openDoc.path,
+                  openDocumentLabel: openDoc.label,
+                  ...(activeMainAppView !== "documents" ? { openDocumentMarkdown: openDoc.markdown } : {}),
+                }
+              : {}),
+            history: prior.slice(-MAX_AGENT_CHAT_HISTORY),
+            debugLlm: readAgentDebugLlm(),
+            replyMarkdown: true,
+            ...(executeOnActive ? { executeOnActiveObject: true } : {}),
+            ...(selectionArg ? { selection: selectionArg } : {}),
+            ...(macroRun ? { promptMacroId: macroRun.id } : {}),
+            ...(askTools
+              ? {
+                  toolsEnabled: true,
+                  ...(askCorpus ? { corpusWide: true } : {}),
+                  ...(askWebSearch ? { webSearch: true } : {}),
+                  activityStream: true,
+                }
+              : {}),
+          },
+          askTools ? { onCorpusActivity: (ev) => pushCorpusActivityRow(ev) } : undefined,
+        );
+      } catch (e) {
+        const err = e as Error & { partialReply?: string; debugLlm?: Record<string, unknown>; runId?: string };
+        if (mode === "agent" && docName && isNetworkFetchFailure(err)) {
+          status.textContent = "Verbinding onderbroken — controleren of Nexus al klaar is…";
+          chatRes = (await recoverAgentDocumentProposal(docName, nexusContext.message)) ?? undefined;
+          if (chatRes) {
+            status.textContent = "Nexus was al klaar; resultaat hersteld na verbindingsonderbreking.";
+          }
+        }
+        if (!chatRes) throw err;
+      }
+      const res = chatRes;
       if (askTools && Array.isArray(res.activities) && res.activities.length) {
         for (const row of res.activities) {
           if (row && row.type === "activity") pushCorpusActivityRow(row);
         }
       }
       if (askTools && res.performanceMetrics) {
-        pushPerformanceMetricsRow(res.performanceMetrics);
+        pushPerformanceMetricsRow(res.performanceMetrics, res.modelTrace);
+      } else if (askTools && res.modelTrace?.length) {
+        pushPerformanceMetricsRow(undefined, res.modelTrace);
       }
       assistantText = res.reply;
       pendingMemoryActions = [];
@@ -4706,8 +7088,20 @@ ${transcript}`;
       if (res.executedMemoryActions?.length || res.corpusCreatedPaths?.length) {
         await refreshAfterMemoryActions(res.executedMemoryActions || [], res.corpusCreatedPaths || []);
       }
+      if (activeMainAppView === "kanban") {
+        await refreshKanbanBoard({ silent: true, skipFocusedDetail: true });
+      } else if (activeMainAppView === "email") {
+        await refreshEmailAgentAll();
+      }
       if (readAgentDebugLlm() && res.debugLlm) {
-        showAgentChatLlmDebug(res.debugLlm as Record<string, unknown>);
+        const debugPayload = { ...(res.debugLlm as Record<string, unknown>) };
+        if (res.structuredToolContext) {
+          debugPayload.nexusStructuredToolContext = res.structuredToolContext;
+        }
+        if (res.evidenceFooter) {
+          debugPayload.nexusEvidenceFooter = res.evidenceFooter;
+        }
+        showAgentChatLlmDebug(debugPayload);
       } else {
         hideAgentChatLlmDebug();
       }
@@ -4731,8 +7125,33 @@ ${transcript}`;
             await syncExternalReviewsAndTemplate(tplSelect.value);
             status.textContent = `Chat-agent: inhoud in de viewer is bijgewerkt; opslaan naar ${externalDocumentSourceLabel()} mislukt (${String((e as Error).message)}). Controleer rood/groen en keur akkoord of niet akkoord; probeer daarna Ctrl+S.`;
           }
-        } else if (res.wroteFile) {
-          await loadDocumentData(name, tplSelect.value);
+        } else if (res.wroteFile || res.movedTo) {
+          const previousPath = name;
+          const activePath = res.documentPath || res.movedTo || name;
+          if (res.movedTo && res.movedTo !== previousPath) {
+            if (editorBoundDoc === previousPath) editorBoundDoc = res.movedTo;
+            if (fileSelect.value === previousPath) fileSelect.value = res.movedTo;
+            selectedFolder = folderOfMarkdownPath(res.movedTo);
+            await loadLists(res.movedTo, { skipSave: true });
+          } else {
+            await loadDocumentData(activePath, tplSelect.value);
+          }
+          if (docName && activePath !== docName) {
+            try {
+              applyReviewPack(await fetchReviewComments(activePath));
+            } catch {
+              /* ongewijzigd laten */
+            }
+          }
+        } else {
+          try {
+            const saved = await saveMarkdownFile(name, res.markdown);
+            currentMd = res.markdown;
+            syncHiddenPrefixFromMarkdown(res.markdown);
+            await followCorpusDocumentMove(name, saved);
+          } catch (e) {
+            status.textContent = `Nexus-voorstel kon niet worden opgeslagen: ${String((e as Error).message)}`;
+          }
         }
         if (editRoot) {
           await refreshEditSurfaceAfterDataLoad();
@@ -4741,51 +7160,73 @@ ${transcript}`;
         refreshAgentPendingDecisionUi();
         if (agentExternalDiskWriteFailed) {
           isDirty = true;
-        } else if (isExternal || res.wroteFile) {
+        } else if (isExternal || res.wroteFile || res.movedTo) {
           isDirty = false;
           status.textContent =
-            "Chat-agent: wijziging staat klaar. Controleer rood/groen in de tekst; keur goed onder het agentantwoord.";
+            "Nexus: reviewvoorstel staat klaar. Controleer rood/groen in de tekst en keur goed of af onder het antwoord.";
         } else {
-          await forcePersistEditor();
           isDirty = false;
           status.textContent =
-            "Chat-agent: wijziging staat klaar en is opgeslagen. Keur goed onder het agentantwoord.";
+            "Nexus: reviewvoorstel staat klaar en is opgeslagen. Keur goed of af onder het antwoord.";
         }
       } else if (mode === "ask") {
         if (res.executedMemoryActions?.length) {
           await refreshAfterMemoryActions(res.executedMemoryActions, res.corpusCreatedPaths || []);
         }
-        status.textContent = askTools
+        maybeSetPendingDocumentEditOffer(text, assistantText, mode, executeOnActive);
+        status.textContent = pendingDocumentEditOffer
+          ? "Nexus: antwoord ontvangen. Gebruik Wijzig document om het voorstel in het bestand te maken."
+          : askTools
           ? askCorpus && askWebSearch
-            ? "Ask (corpus + internet): antwoord ontvangen."
+            ? `Nexus: antwoord ontvangen met ${nexusContext.contextLabel}, corpus en internetcontext.`
             : askCorpus
-              ? "Ask (corpus): antwoord ontvangen."
-              : "Ask (internet): antwoord ontvangen."
-          : "Ask: antwoord ontvangen.";
+              ? `Nexus: antwoord ontvangen met ${nexusContext.contextLabel} en corpuscontext.`
+              : `Nexus: antwoord ontvangen met ${nexusContext.contextLabel} en internetcontext.`
+          : `Nexus: antwoord ontvangen met ${nexusContext.contextLabel}.`;
         if (askCorpus && res.viewerActions?.length) {
           await applyViewerActions(res.viewerActions);
         }
       } else {
-        status.textContent = "Agent: geen bestandswijziging (of alleen antwoord).";
+        status.textContent = "Nexus: geen documentwijziging voorgesteld.";
+      }
+      if (res.organicMemoryReflection?.scheduled) {
+        status.textContent = `${status.textContent} Geheugen wordt op de achtergrond verrijkt.`;
       }
     } catch (e) {
-      const err = e as Error & { partialReply?: string; debugLlm?: Record<string, unknown> };
+      const err = e as Error & { partialReply?: string; debugLlm?: Record<string, unknown>; runId?: string };
       if (readAgentDebugLlm() && err.debugLlm && typeof err.debugLlm === "object") {
         showAgentChatLlmDebug(err.debugLlm);
       }
+      const runHint = err.runId ? `\n\nRun-id: ${err.runId}` : "";
       if (err.partialReply) {
-        assistantText = `${err.partialReply}\n\n— ${err.message}`;
+        assistantText = `${err.partialReply}\n\n— ${err.message}${runHint}`;
       } else {
-        assistantText = `Fout: ${err.message}`;
+        assistantText = `Fout: ${err.message}${runHint}`;
       }
-      status.textContent = "Agent-chat mislukt — zie het paneel.";
+      status.textContent = "Nexus-chat mislukt — zie het paneel.";
     } finally {
-      const nextHistory = submittedHistory.slice();
-      nextHistory.push({ role: "assistant", content: assistantText, mode });
-      agentChatHistory = normalizeAgentChatHistoryForUi(nextHistory);
+      if (assistantText.trim()) {
+        const assistantTurn: AgentChatTurn = { role: "assistant", content: assistantText, mode };
+        const assistantSig = agentChatTurnSignature(assistantTurn);
+        if (!agentChatHistory.some((turn) => agentChatTurnSignature(turn) === assistantSig)) {
+          const nextHistory = submittedHistory.slice();
+          nextHistory.push(assistantTurn);
+          agentChatHistory = normalizeAgentChatHistoryForUi(nextHistory);
+        }
+      }
+      if (mode === "agent" && docName) {
+        try {
+          const pack = await fetchReviewComments(docName);
+          reviewComments = pack.comments;
+          syncDocumentChatToSession(pack.agentChatUiHistory);
+        } catch {
+          /* ongewijzigd laten */
+        }
+      }
       await persistActiveAgentChatSession({ active: true });
       setAgentChatRequestBusy(false);
       rerenderAgentChatMessages();
+      if (executeOnActive) resetNexusExecuteOnActive();
     }
   }
 
@@ -4797,12 +7238,11 @@ ${transcript}`;
     agentChatMode = "ask";
     refreshAgentChatModeUi();
   });
-  agentCorpusWideCheckbox.addEventListener("change", () => refreshAgentChatModeUi());
-  agentWebSearchCheckbox.addEventListener("change", () => refreshAgentChatModeUi());
   agentChatSessionSelect.addEventListener("change", () => void switchAgentChatSession(agentChatSessionSelect.value));
   agentChatNewBtn.addEventListener("click", () => void createNewAgentChat());
   agentChatRenameBtn.addEventListener("click", () => void renameActiveAgentChat());
   agentChatDeleteBtn.addEventListener("click", () => void deleteActiveAgentChat());
+  agentChatSummarizeBtn.addEventListener("click", () => void summarizeActiveChat());
   agentChatPromoteBtn.addEventListener("click", () => void promoteActiveChatToMemory());
   agentChatPromoteStaleBtn.addEventListener("click", () => void promoteStaleChatsToMemory());
   agentMemoryToggleBtn.addEventListener("click", () => {
@@ -4814,6 +7254,8 @@ ${transcript}`;
   agentAskToAgentBtn.addEventListener("click", () => prepareLastAskReplyForAgent());
   promptMacroBtn.addEventListener("click", () => void showPromptMacroDialog());
   meetingReportBtn.addEventListener("click", () => showMeetingReportDialog());
+  nexusReportIssueBtn.addEventListener("click", () => void reportCurrentNexusIssue());
+  nexusVerifyFixlogBtn.addEventListener("click", () => void prepareNexusFixlogVerification());
   agentChatClearBtn.addEventListener("click", () => clearAgentChat());
   agentChatSendBtn.addEventListener("click", () => void submitAgentChat());
   promptMacroSelect.addEventListener("change", () => fillPromptMacroForm(selectedPromptMacro()));
@@ -4844,6 +7286,7 @@ ${transcript}`;
     }
   });
   refreshAgentChatModeUi();
+  refreshNexusExecuteOnActiveUi();
   syncAgentChatDisabled();
   void loadAgentChatSessions();
 
@@ -4871,7 +7314,7 @@ ${transcript}`;
     const reviewTargetName =
       name === EXTERNAL_MARKDOWN_VALUE ? getOrCreateExternalAgentVirtualName() : name;
     const hasPendingAgentReview = reviewComments.some(lastReplyIsFromAgent);
-    let html = renderMarkdown(currentMd).html;
+    let html = renderMarkdown(stripHiddenDocumentPrefix(currentMd)).html;
     let showChangeMarkers = false;
     if (hasPendingAgentReview) {
       try {
@@ -5176,6 +7619,11 @@ ${transcript}`;
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") void flushAutoSave();
+    else maybeAutoRefreshKanbanBoard();
+  });
+  window.addEventListener("focus", () => {
+    maybeAutoRefreshKanbanBoard();
+    void maybeRefreshAfterCorpusOrganizerMove();
   });
 
   type FileTreeDirNode = {
@@ -5264,6 +7712,49 @@ ${transcript}`;
     for (let i = 0; i < parts.length - 1; i++) {
       acc = acc ? `${acc}/${parts[i]}` : parts[i];
       fileTreeExpandedPaths.add(acc);
+    }
+  }
+
+  function ensureMarkdownFileOption(relPath: string): void {
+    if (Array.from(fileSelect.options).some((o) => o.value === relPath)) return;
+    const o = document.createElement("option");
+    o.value = relPath;
+    o.textContent = relPath;
+    fileSelect.append(o);
+    if (!corpusMarkdownPaths.includes(relPath)) {
+      corpusMarkdownPaths = [...corpusMarkdownPaths, relPath].sort((a, b) => a.localeCompare(b));
+    }
+  }
+
+  /** Naamloos draft in 00-inbox/; geen bestandsnaam-prompt. Corpus Gardener hernoemt na inhoud. */
+  async function openNewUntitledDocument(): Promise<void> {
+    if (!(await confirmLeaveEditModeForImport())) return;
+    try {
+      clearExternalMarkdownSession();
+      const { name } = await createNewWorkDocumentDraft();
+      selectedFolder = "00-inbox";
+      fileTreeExpandedPaths.add("00-inbox");
+      try {
+        await loadLists(name);
+        status.textContent =
+          "Naamloos document geopend. Vul het via de editor of Nexus — Corpus Gardener geeft het daarna een naam en plek.";
+      } catch (loadErr) {
+        ensureMarkdownFileOption(name);
+        fileSelect.value = name;
+        await loadSelection();
+        status.textContent =
+          "Naamloos document geopend. Bestandsindex kon niet volledig ververst worden; het document staat wel klaar in de editor.";
+        console.warn("loadLists na new-draft mislukt:", loadErr);
+        void fetchMarkdownIndex()
+          .then(({ files, folders }) => {
+            corpusMarkdownPaths = files.slice();
+            corpusMarkdownFolders = folders.slice();
+            refreshFileTree();
+          })
+          .catch(() => {});
+      }
+    } catch (e) {
+      status.textContent = `Nieuw document mislukt: ${String((e as Error).message)}`;
     }
   }
 
@@ -5563,7 +8054,7 @@ ${transcript}`;
       row.style.paddingLeft = `${22 + depth * 14}px`;
       if (filePath === sel) row.classList.add("is-selected");
 
-      const openBtn = el("button", "mv-file-tree-file-name", base);
+      const openBtn = el("button", "mv-file-tree-file-name", displayNameMd(filePath));
       openBtn.type = "button";
       openBtn.title = filePath;
       openBtn.addEventListener("click", () => {
@@ -5614,6 +8105,85 @@ ${transcript}`;
     }
   }
 
+  let corpusSearchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function renderCorpusSearchHits(results: CorpusSearchResult[]): void {
+    corpusSearchPanel.replaceChildren();
+    if (!results.length) {
+      corpusSearchPanel.hidden = true;
+      return;
+    }
+    corpusSearchPanel.hidden = false;
+    const head = el("div", "mv-corpus-search-head", "Corpus-zoekresultaten");
+    corpusSearchPanel.append(head);
+    for (const hit of results.slice(0, 10)) {
+      const openPath = hit.isRedirect && hit.redirectTo ? hit.redirectTo : hit.path;
+      const btn = el("button", "mv-corpus-search-hit");
+      btn.type = "button";
+      btn.innerHTML = `<strong>${hit.title}</strong><span>${hit.scope === "memory" ? "memory" : "werk"} · ${openPath}</span>`;
+      btn.addEventListener("click", async () => {
+        if (hit.scope === "memory") {
+          status.textContent = `Memory-document: ${openPath} (open via geheugenpaneel)`;
+          return;
+        }
+        if (!corpusMarkdownPaths.includes(openPath)) {
+          await loadLists(openPath);
+        }
+        if (corpusMarkdownPaths.includes(openPath)) {
+          fileSelect.value = openPath;
+          selectedFolder = folderOfMarkdownPath(openPath);
+          await loadSelection();
+          clearFileTreeSearch();
+        }
+      });
+      corpusSearchPanel.append(btn);
+    }
+  }
+
+  function clearFileTreeSearch(opts: { refresh?: boolean } = {}): void {
+    if (corpusSearchTimer) {
+      clearTimeout(corpusSearchTimer);
+      corpusSearchTimer = null;
+    }
+    fileTreeFilter.value = "";
+    corpusSearchPanel.hidden = true;
+    corpusSearchPanel.replaceChildren();
+    if (fileTreeFilterHadQuery || fileTreeExpandedPaths.size > 0) {
+      fileTreeExpandedPaths.clear();
+      collapseTreeAfterSearchClear = true;
+    }
+    fileTreeFilterHadQuery = false;
+    if (opts.refresh !== false) refreshFileTree();
+  }
+
+  function scheduleCorpusSearchFromTreeFilter(): void {
+    const q = fileTreeFilter.value.trim();
+    if (corpusSearchTimer) clearTimeout(corpusSearchTimer);
+
+    if (!q && fileTreeFilterHadQuery) {
+      fileTreeExpandedPaths.clear();
+      collapseTreeAfterSearchClear = true;
+    }
+    fileTreeFilterHadQuery = q.length > 0;
+
+    refreshFileTree();
+
+    if (q.length < 2) {
+      corpusSearchPanel.hidden = true;
+      corpusSearchPanel.replaceChildren();
+      return;
+    }
+    corpusSearchTimer = setTimeout(() => {
+      corpusSearchTimer = null;
+      void searchCorpus(q, { limit: 10, scope: "both" })
+        .then((payload) => renderCorpusSearchHits(payload.results || []))
+        .catch(() => {
+          corpusSearchPanel.hidden = true;
+          corpusSearchPanel.replaceChildren();
+        });
+    }, 200);
+  }
+
   function refreshFileTree(): void {
     const prevScroll = fileTreeScroll.scrollTop;
     fileTreeScroll.replaceChildren();
@@ -5624,7 +8194,10 @@ ${transcript}`;
       folderMatchesTreeFilter(folderPath, q, filteredFiles),
     );
 
-    if (sel && sel !== EXTERNAL_MARKDOWN_VALUE && corpusMarkdownPaths.includes(sel)) {
+    const skipAutoExpand = collapseTreeAfterSearchClear;
+    if (collapseTreeAfterSearchClear) collapseTreeAfterSearchClear = false;
+
+    if (!skipAutoExpand && !q && sel && sel !== EXTERNAL_MARKDOWN_VALUE && corpusMarkdownPaths.includes(sel)) {
       expandFileTreeAncestors(sel);
     }
     if (q) {
@@ -5653,9 +8226,9 @@ ${transcript}`;
     });
   }
 
-  fileTreeFilter.addEventListener("input", () => refreshFileTree());
+  fileTreeFilter.addEventListener("input", () => scheduleCorpusSearchFromTreeFilter());
 
-  async function loadLists(preferredMd?: string) {
+  async function loadLists(preferredMd?: string, opts?: { skipSave?: boolean }) {
     const externalWasSelected = fileSelect.value === EXTERNAL_MARKDOWN_VALUE;
     const keepExternal = externalDocumentKind !== "none";
 
@@ -5730,7 +8303,7 @@ ${transcript}`;
       tplSelect.value = pickTpl;
     }
 
-    await loadSelection();
+    await loadSelection({ skipSave: opts?.skipSave });
   }
 
   async function loadDocumentData(name: string, tplName: string): Promise<void> {
@@ -5768,24 +8341,32 @@ ${transcript}`;
       }
       return;
     }
-    currentMd = await fetchMarkdownFile(name);
+    const resolved = await fetchMarkdownFileResolved(name);
+    currentMd = resolved.content;
+    syncHiddenPrefixFromMarkdown(resolved.content);
+    if (resolved.path !== name && corpusMarkdownPaths.includes(resolved.path)) {
+      fileSelect.value = resolved.path;
+      selectedFolder = folderOfMarkdownPath(resolved.path);
+      if (editorBoundDoc === name) editorBoundDoc = resolved.path;
+    }
     try {
-      applyReviewPack(await fetchReviewComments(name));
+      applyReviewPack(await fetchReviewComments(resolved.path));
     } catch {
       reviewComments = [];
       rerenderAgentChatMessages();
     }
+    const displayName = resolved.path;
     try {
       if (!tplName || !templatesAvailable) {
         currentMerged = {};
-        status.textContent = `${name} — ingebouwde defaults (geen templatebestanden).`;
+        status.textContent = `${displayName} — ingebouwde defaults (geen templatebestanden).`;
       } else {
         const raw = await fetchTemplate(tplName);
         currentMerged = asTemplate(raw);
-        status.textContent = `${name} — ${tplName}`;
+        status.textContent = `${displayName} — ${tplName}`;
       }
     } catch {
-      status.textContent = `${name} — template niet gelezen (${tplName}), defaults gebruiken.`;
+      status.textContent = `${displayName} — template niet gelezen (${tplName}), defaults gebruiken.`;
       currentMerged = {};
     }
   }
@@ -5816,10 +8397,12 @@ ${transcript}`;
     }
   }
 
-  async function loadSelection() {
+  async function loadSelection(opts?: { skipSave?: boolean }) {
     clearAgentSnippetHighlights(proseHost);
     try {
-      await saveCurrentEditorToBoundDoc();
+      if (!opts?.skipSave) {
+        await saveCurrentEditorToBoundDoc();
+      }
       const name = fileSelect.value;
       const tplName = tplSelect.value;
       if (!name) {
@@ -5863,7 +8446,7 @@ ${transcript}`;
     const name = fileSelect.value;
     if (!name) return;
     const isExternal = name === EXTERNAL_MARKDOWN_VALUE;
-    if (!isExternal) await flushAutoSave();
+    if (!isExternal) await ensureDocumentPersistedBeforeAgent(name, isExternal);
     if (reviewComments.some(lastReplyIsFromAgent)) {
       status.textContent =
         "Keur eerst alle vorige agentwijzigingen goed of af voordat je een nieuwe agent-run start.";
@@ -5877,7 +8460,8 @@ ${transcript}`;
         return;
       }
       setReviewAgentBusy(true);
-      status.textContent = "Agent verwerkt opmerkingen…";
+      status.textContent = "Nexus verwerkt opmerkingen…";
+      const chatLenBefore = agentChatHistory.length;
       let result;
       if (isExternal) {
         const virtual = getOrCreateExternalAgentVirtualName();
@@ -5887,19 +8471,19 @@ ${transcript}`;
           name: virtual,
           external: true,
           markdown: mdPayload,
-          replyMarkdown: agentReplyMarkdownCheckbox.checked,
+          replyMarkdown: true,
         });
         if (typeof result.markdown === "string") {
           currentMd = result.markdown;
           try {
             await writeExternalMarkdown(result.markdown);
           } catch (e) {
-            status.textContent = `Agent klaar maar schijf niet bijgewerkt: ${String((e as Error).message)}`;
+            status.textContent = `Nexus klaar maar schijf niet bijgewerkt: ${String((e as Error).message)}`;
           }
         }
         await loadDocumentData(EXTERNAL_MARKDOWN_VALUE, tplSelect.value);
       } else {
-        result = await runAgent({ name, replyMarkdown: agentReplyMarkdownCheckbox.checked });
+        result = await runAgent({ name, replyMarkdown: true });
         await loadDocumentData(name, tplSelect.value);
       }
       await refreshEditSurfaceAfterDataLoad();
@@ -5910,10 +8494,15 @@ ${transcript}`;
           ? `${displayLabel} — geen commentaren om te verwerken (${result.skipped} overgeslagen: al door agent beantwoord of zonder tekst/citaat).`
           : `${displayLabel} — agent klaar: ${result.processed} verwerkt, ` +
             `${result.changed} patch(es), ${result.failed} fout(en), ${result.skipped} overgeslagen.`;
+      if (agentChatHistory.length > chatLenBefore) {
+        await persistActiveAgentChatSession({ active: true });
+      }
     } catch (e) {
-      status.textContent = `Agent uitvoeren mislukt: ${String((e as Error).message)}`;
+      status.textContent = `Nexus uitvoeren mislukt: ${String((e as Error).message)}`;
     } finally {
       setReviewAgentBusy(false);
+      rerenderAgentChatMessages();
+      resetNexusExecuteOnActive();
     }
   }
 
@@ -5982,7 +8571,19 @@ ${transcript}`;
   async function openConfluencePageInEditor(input: { pageId?: string; url?: string }): Promise<void> {
     if (!(await confirmLeaveEditModeForImport())) return;
     status.textContent = "Confluence-pagina ophalen…";
-    const page = await fetchConfluencePage(input);
+    let page;
+    try {
+      page = await fetchConfluencePage(input);
+    } catch (e) {
+      const message = String((e as Error).message || e);
+      if (/auth\.hosted-tools|SSO|browser-sessie|authenticatie mislukt/i.test(message)) {
+        status.textContent = "Confluence SSO-sessie ophalen uit browser…";
+        await syncConfluenceBrowserSession();
+        page = await fetchConfluencePage(input);
+      } else {
+        throw e;
+      }
+    }
     externalDocumentKind = "confluence";
     externalFileHandle = null;
     externalConfluencePage = {
@@ -6141,6 +8742,7 @@ ${transcript}`;
     void loadSelection();
   });
   browseFilesBtn.addEventListener("click", () => void openMarkdownFromDiskWithPicker());
+  newDocBtn.addEventListener("click", () => void openNewUntitledDocument());
   mobileFileTreeBtn.addEventListener("click", () => openMobileFileTree());
   mobileMenuBtn.addEventListener("click", () => openMobileMenu());
   mobileChatBtn.addEventListener("click", () => toggleMobileChat());
@@ -6154,10 +8756,70 @@ ${transcript}`;
     else syncMobileOverlayState();
   });
   window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") closeMobileOverlays();
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      setMainAppView("documents");
+      openMobileFileTree();
+      fileTreeFilter.select();
+      return;
+    }
+    if (e.key === "Escape") {
+      if (fileTreeFilter.value.trim()) {
+        e.preventDefault();
+        clearFileTreeSearch();
+        return;
+      }
+      if (activeMainAppView !== "documents") setMainAppView("documents");
+      closeMobileOverlays();
+    }
   });
+  documentViewBtn.addEventListener("click", () => setMainAppView("documents"));
+  emailViewBtn.addEventListener("click", () => openEmailAgentPanel());
+  kanbanViewBtn.addEventListener("click", () => openKanbanPanel());
   confluenceImportBtn.addEventListener("click", () => showConfluenceImportDialog());
+  confluenceImportSyncBtn.addEventListener("click", () => {
+    void (async () => {
+      confluenceImportSyncBtn.disabled = true;
+      try {
+        status.textContent = "Confluence Edge/CDP starten…";
+        const started = await startConfluenceBrowserSession().catch(() => ({ ok: false as const }));
+        if (started.ok && !started.alreadyRunning) {
+          status.textContent = "Log in op Confluence in het Edge-venster, daarna opnieuw Browser-sessie.";
+        }
+        status.textContent = "Confluence browser-sessie synchroniseren…";
+        const result = await syncConfluenceBrowserSession();
+        status.textContent = result.ok
+          ? "Confluence browser-sessie gekoppeld."
+          : started.ok
+            ? "Edge is open. Log in op Confluence en klik opnieuw op Browser-sessie."
+            : `Confluence browser-sessie mislukt: ${result.error || "onbekende fout"}`;
+      } catch (e) {
+        status.textContent = `Confluence browser-sessie mislukt: ${String((e as Error).message)}`;
+      } finally {
+        confluenceImportSyncBtn.disabled = false;
+      }
+    })();
+  });
   confluenceSearchBtn.addEventListener("click", () => showConfluenceSearchDialog());
+  emailAgentBtn.addEventListener("click", () => openEmailAgentPanel());
+  kanbanBtn.addEventListener("click", () => openKanbanPanel());
+  kanbanCloseBtn.addEventListener("click", () => {
+    setMainAppView("documents");
+  });
+  kanbanProjectFilterSelect.addEventListener("change", () => {
+    kanbanProjectFilter = kanbanProjectFilterSelect.value;
+    kanbanSelectedTaskId = "";
+    closeKanbanDetailOverlay();
+    renderKanbanBoard();
+  });
+  kanbanRefreshBtn.addEventListener("click", () => void refreshKanbanBoard({ silent: false, soft: true }));
+  kanbanNewBtn.addEventListener("click", () => void createBlankKanbanTask());
+  document.addEventListener("keydown", handleKanbanOverlayEscape);
+  emailAgentCloseBtn.addEventListener("click", () => {
+    setMainAppView("documents");
+  });
+  emailAgentRefreshBtn.addEventListener("click", () => void refreshEmailAgentAll());
+  emailAgentScanBtn.addEventListener("click", () => void runEmailAgentScanFromUi());
   confluenceImportCancelBtn.addEventListener("click", () => hideConfluenceImportDialog());
   confluenceImportRunBtn.addEventListener("click", () => void importConfluencePageToEditor());
   confluenceImportDialog.addEventListener("mousedown", (e) => {
@@ -6355,6 +9017,20 @@ ${transcript}`;
   agentInstructionsSaveBtn.addEventListener("click", () => void saveSettingsAgentInstructions());
   settingsLogsRefreshBtn.addEventListener("click", () => void refreshSettingsAgentLogs());
   settingsActivityLogsBtn.addEventListener("click", () => void refreshSettingsActivityLogs());
+  emailAgentSettingsSaveBtn.addEventListener("click", () => void saveEmailAgentConfigFromSettings());
+  emailAgentSettingsScanBtn.addEventListener("click", () => void runEmailAgentScanFromUi());
+  emailAgentNotifyBtn.addEventListener("click", () => {
+    if (!("Notification" in window)) {
+      status.textContent = "Browsermeldingen worden in deze browser niet ondersteund.";
+      return;
+    }
+    void Notification.requestPermission().then((permission) => {
+      status.textContent =
+        permission === "granted"
+          ? "Browsermeldingen voor de e-mailagent staan aan."
+          : "Browsermeldingen zijn niet toegestaan.";
+    });
+  });
   settingsLogsClearBtn.addEventListener("click", () =>
     void (async () => {
       try {
@@ -6464,6 +9140,10 @@ ${transcript}`;
   try {
     await loadLists();
     refreshTemplateVars();
+    await refreshEmailAgentAll();
+    window.setInterval(() => void refreshEmailAgentAll({ notifyNew: true }), 60000);
+    window.setInterval(() => maybeAutoRefreshKanbanBoard(), KANBAN_AUTO_REFRESH_MS);
+    window.setInterval(() => void maybeRefreshAfterCorpusOrganizerMove(), CORPUS_ORGANIZER_POLL_MS);
   } catch (e) {
     status.textContent =
       `API niet bereikbaar (${String((e as Error).message)}). In map markdown-viewer: npm run dev ` +

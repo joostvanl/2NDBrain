@@ -1,4 +1,6 @@
 # Secrets & lokale config (nooit committen)
+poc-confluence/.edge-profile/
+markdown-viewer/.confluence-edge-profile/
 .env
 .env.local
 **/.env.docker.local

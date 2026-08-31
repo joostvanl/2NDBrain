@@ -10,6 +10,12 @@ const MANIFEST_FILE = "manifest.json";
 export const CORPUS_OVERVIEW_FILE = "CORPUS_OVERVIEW.md";
 export const CORPUS_GRAPH_FILE = "CORPUS_GRAPH.md";
 
+const DEFAULT_YIELD_EVERY = 15;
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 /** Nederlandse / Engelse stopwords voor lichte retrieval */
 const STOP = new Set([
   "de",
@@ -70,10 +76,10 @@ export function retrievalBudgetForQuestion(question, opts = {}) {
       maxDocs: 10,
       hintDocs: 10,
       compactDocs: 42,
-      compactPreviewChars: 120,
-      maxCompactChars: 5200,
-      sectionLimit: 14,
-      sectionPreviewChars: 170,
+      compactPreviewChars: 100,
+      maxCompactChars: 4500,
+      sectionLimit: 12,
+      sectionPreviewChars: 150,
     },
     broad: {
       profile: "broad",
@@ -345,6 +351,144 @@ function extractFrontmatter(content) {
     properties[currentKey] = parseFrontmatterValue(kv[2]);
   }
   return { properties, body: text.slice(m[0].length) };
+}
+
+export const CORPUS_META_COMMENT_MARKER = "ioms-corpus-meta";
+
+const CORPUS_META_COMMENT_RE = /<!--\s*ioms-corpus-meta\s*\n([\s\S]*?)\s*-->/i;
+
+const CORPUS_META_KEYS = new Set([
+  "doc_id",
+  "organized_at",
+  "aliases",
+  "type",
+  "moved_to",
+  "moved_at",
+  "title",
+]);
+
+function parseCorpusMetaLines(block) {
+  const properties = {};
+  let currentKey = "";
+  for (const line of String(block || "").split("\n")) {
+    if (/^\s*-\s+/.test(line) && currentKey) {
+      const prev = properties[currentKey];
+      const arr = Array.isArray(prev) ? prev : prev === "" || prev == null ? [] : [prev];
+      arr.push(parseFrontmatterValue(line.replace(/^\s*-\s+/, "")));
+      properties[currentKey] = arr;
+      continue;
+    }
+    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!kv) continue;
+    currentKey = kv[1];
+    properties[currentKey] = parseFrontmatterValue(kv[2]);
+  }
+  return properties;
+}
+
+function extractCorpusMetaComment(content) {
+  const text = String(content || "").replace(/\r\n/g, "\n");
+  const m = CORPUS_META_COMMENT_RE.exec(text);
+  if (!m) return { properties: {}, body: text };
+  return {
+    properties: parseCorpusMetaLines(m[1]),
+    body: `${text.slice(0, m.index)}${text.slice(m.index + m[0].length)}`.replace(/^\n+/, ""),
+  };
+}
+
+export function extractDocumentMetadata(content) {
+  const text = String(content || "").replace(/\r\n/g, "\n");
+  const fromComment = extractCorpusMetaComment(text);
+  const fromFrontmatter = extractFrontmatter(fromComment.body);
+  const properties = { ...fromFrontmatter.properties, ...fromComment.properties };
+  return {
+    properties,
+    body: fromFrontmatter.body,
+  };
+}
+
+function serializeCorpusMetaProperties(properties) {
+  const lines = [CORPUS_META_COMMENT_MARKER];
+  for (const [key, value] of Object.entries(properties || {})) {
+    if (value == null || value === "") continue;
+    if (Array.isArray(value)) {
+      if (!value.length) continue;
+      lines.push(`${key}:`);
+      for (const item of value) lines.push(`  - ${JSON.stringify(String(item))}`);
+      continue;
+    }
+    if (typeof value === "boolean") {
+      lines.push(`${key}: ${value}`);
+      continue;
+    }
+    lines.push(`${key}: ${JSON.stringify(String(value))}`);
+  }
+  return `<!--\n${lines.join("\n")}\n-->`;
+}
+
+export function stripCorpusMetaFromMarkdown(content) {
+  const withoutComment = String(content || "")
+    .replace(/\r\n/g, "\n")
+    .replace(CORPUS_META_COMMENT_RE, "")
+    .replace(/^\n+/, "");
+  const { properties, body } = extractFrontmatter(withoutComment);
+  const remaining = Object.fromEntries(
+    Object.entries(properties).filter(([key]) => !CORPUS_META_KEYS.has(key)),
+  );
+  if (!Object.keys(remaining).length) return body.replace(/^\n+/, "");
+  const lines = ["---"];
+  for (const [key, value] of Object.entries(remaining)) {
+    if (Array.isArray(value)) {
+      lines.push(`${key}:`);
+      for (const item of value) lines.push(`  - ${JSON.stringify(String(item))}`);
+    } else if (value != null && value !== "") {
+      lines.push(`${key}: ${JSON.stringify(String(value))}`);
+    }
+  }
+  lines.push("---", "");
+  return `${lines.join("\n")}${body.replace(/^\n+/, "")}`;
+}
+
+export function ensureCorpusMetaComment(content, docId, extra = {}) {
+  const meta = extractDocumentMetadata(content);
+  const aliases = new Set(valuesAsStrings(meta.properties.aliases));
+  for (const value of valuesAsStrings(extra.aliases)) aliases.add(value);
+  const nextId =
+    docId ||
+    meta.properties.doc_id ||
+    valuesAsStrings(extra.doc_id)[0] ||
+    slugifyDocIdFromBasename(content);
+  const nextProps = {
+    doc_id: nextId,
+    organized_at: meta.properties.organized_at || extra.organized_at || new Date().toISOString(),
+    ...Object.fromEntries(
+      Object.entries(extra).filter(([key]) => !["aliases", "doc_id", "organized_at"].includes(key)),
+    ),
+  };
+  if (aliases.size) nextProps.aliases = [...aliases];
+  const visibleBody = stripCorpusMetaFromMarkdown(content);
+  return {
+    content: `${serializeCorpusMetaProperties(nextProps)}\n\n${visibleBody}`.trimEnd() + "\n",
+    docId: nextId,
+  };
+}
+
+function slugifyDocIdFromBasename(content) {
+  const meta = extractDocumentMetadata(content);
+  for (const line of meta.body.split("\n")) {
+    const hm = /^#\s+(.+)$/.exec(line.trim());
+    if (hm) {
+      const slug = hm[1]
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80);
+      if (slug) return slug;
+    }
+  }
+  return `doc-${Date.now()}`;
 }
 
 function valuesAsStrings(value) {
@@ -704,6 +848,8 @@ export async function rebuildCorpusIndex(markdownDir, opts = {}) {
   const paths = listAllMarkdownRelative(sourceRoot, opts);
   const entries = [];
   const contentByPath = new Map();
+  const yieldEvery = opts.yieldEvery ?? DEFAULT_YIELD_EVERY;
+  let fileIdx = 0;
 
   for (const rel of paths) {
     const full = path.join(sourceRoot, ...rel.split("/"));
@@ -713,8 +859,12 @@ export async function rebuildCorpusIndex(markdownDir, opts = {}) {
     } catch {
       continue;
     }
+    fileIdx += 1;
+    if (yieldEvery > 0 && fileIdx % yieldEvery === 0) {
+      await yieldToEventLoop();
+    }
     contentByPath.set(rel, content);
-    const { properties, body } = extractFrontmatter(content);
+    const { properties, body } = extractDocumentMetadata(content);
     const title =
       valuesAsStrings(properties.title)[0]?.trim() ||
       extractTitle(body, path.basename(rel));
@@ -733,6 +883,10 @@ export async function rebuildCorpusIndex(markdownDir, opts = {}) {
     entries.push({
       path: rel,
       title,
+      docId: valuesAsStrings(properties.doc_id)[0] || null,
+      aliases: valuesAsStrings(properties.aliases),
+      isRedirect: String(properties.type || "").toLowerCase() === "redirect",
+      redirectTo: String(properties.moved_to || properties.movedTo || "").replace(/\\/g, "/") || null,
       headings,
       linksOut,
       tags,
@@ -761,13 +915,22 @@ export async function rebuildCorpusIndex(markdownDir, opts = {}) {
     for (const tag of e.tags || []) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
   }
 
-  const enriched = entries.map((e) => ({
-    ...e,
-    linksInCount: inbound[e.path] || 0,
-    backlinks: (backlinksByPath.get(e.path) || []).sort((a, b) => a.localeCompare(b)),
-    unlinkedMentions: unlinkedMentionsFor(e, entries, contentByPath),
-    related: relatedFor(entries, kwPerPath, e.path),
-  }));
+  if (yieldEvery > 0) await yieldToEventLoop();
+
+  const enriched = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    enriched.push({
+      ...e,
+      linksInCount: inbound[e.path] || 0,
+      backlinks: (backlinksByPath.get(e.path) || []).sort((a, b) => a.localeCompare(b)),
+      unlinkedMentions: unlinkedMentionsFor(e, entries, contentByPath),
+      related: relatedFor(entries, kwPerPath, e.path),
+    });
+    if (yieldEvery > 0 && (i + 1) % yieldEvery === 0) {
+      await yieldToEventLoop();
+    }
+  }
 
   const manifest = {
     version: 1,
@@ -844,12 +1007,94 @@ export function readManifest(markdownDir, opts = {}) {
   }
 }
 
+export function filterManifestEntries(manifest, excludePathPatterns = []) {
+  const patterns = (Array.isArray(excludePathPatterns) ? excludePathPatterns : [])
+    .map((p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, ""))
+    .filter(Boolean);
+  if (!manifest?.entries?.length || !patterns.length) return manifest;
+  const entries = manifest.entries.filter((entry) => {
+    const pathNorm = String(entry.path || "").replace(/\\/g, "/");
+    return !patterns.some((pattern) => pathNorm.includes(pattern.replace(/\/+$/, "")));
+  });
+  return { ...manifest, entries };
+}
+
+/**
+ * Actueel pad na Corpus Gardener-verplaatsing (match op pad, doc_id of alias).
+ * @returns {string | null}
+ */
+export function resolveCanonicalDocumentPath(manifest, requestedPath, content = null) {
+  const req = String(requestedPath || "").replace(/\\/g, "/").trim();
+  if (!req) return null;
+  const entries = Array.isArray(manifest?.entries) ? manifest.entries : [];
+
+  let docId = null;
+  if (content != null) {
+    docId = valuesAsStrings(extractDocumentMetadata(content).properties.doc_id)[0] || null;
+  }
+
+  for (const entry of entries) {
+    if (entry.isRedirect) continue;
+    if (entry.path === req) return entry.path;
+  }
+  if (docId) {
+    for (const entry of entries) {
+      if (entry.isRedirect) continue;
+      if (entry.docId === docId) return entry.path;
+    }
+  }
+  for (const entry of entries) {
+    if (entry.isRedirect) continue;
+    if (valuesAsStrings(entry.aliases).includes(req)) return entry.path;
+  }
+  return null;
+}
+
+export function searchCorpusManifests(question, manifests, opts = {}) {
+  const limit = Math.max(1, Math.min(50, Number(opts.limit || 20) || 20));
+  const minScore = Number(opts.minScore || 0);
+  const scopes = Array.isArray(manifests) ? manifests : [];
+  const merged = [];
+  for (const item of scopes) {
+    const manifest = item?.manifest;
+    const scope = item?.scope || manifest?.scope || "working";
+    if (!manifest?.entries?.length) continue;
+    const scored = scoreEntriesForQuestion(question, manifest);
+    for (const row of scored) {
+      if (row.score <= minScore) continue;
+      merged.push({
+        scope,
+        score: row.score,
+        path: row.entry.path,
+        title: row.entry.title,
+        docId: row.entry.docId || null,
+        preview: row.entry.preview || "",
+        tags: row.entry.tags || [],
+        isRedirect: row.entry.isRedirect === true,
+        redirectTo: row.entry.redirectTo || null,
+      });
+    }
+  }
+  merged.sort((a, b) => b.score - a.score);
+  return {
+    query: String(question || ""),
+    results: merged.slice(0, limit),
+    meta: {
+      algorithm: "bm25",
+      returnedCount: Math.min(limit, merged.length),
+      candidateCount: merged.length,
+    },
+  };
+}
+
 export function scoreEntriesForQuestion(question, manifest) {
   if (!manifest?.entries?.length) return [];
   const docs = manifest.entries.map((entry) => ({
     entry,
     text: [
       entry.path,
+      entry.docId,
+      Array.isArray(entry.aliases) ? entry.aliases.join(" ") : "",
       entry.title,
       Array.isArray(entry.headings) ? entry.headings.join(" ") : "",
       Array.isArray(entry.tags) ? entry.tags.join(" ") : "",
@@ -900,6 +1145,9 @@ function truncateMiddle(msg, max) {
  */
 export function buildCorpusAskContext(markdownDir, manifest, question, opts = {}) {
   const sourceRoot = opts.sourceRootDir ? path.resolve(opts.sourceRootDir) : path.resolve(markdownDir);
+  const effectiveManifest = opts.excludePathPatterns?.length
+    ? filterManifestEntries(manifest, opts.excludePathPatterns)
+    : manifest;
   const budget = retrievalBudgetForQuestion(question, opts.retrievalBudget || {});
   const maxDocs = opts.maxDocs ?? budget.maxDocs;
   const charsPerDoc = opts.charsPerDoc ?? 4000;
@@ -907,14 +1155,14 @@ export function buildCorpusAskContext(markdownDir, manifest, question, opts = {}
   const includeFragments = opts.includeFragments !== false;
   const maxCompactChars = opts.maxCompactChars ?? (includeFragments ? 200000 : budget.maxCompactChars);
 
-  const scored = scoreEntriesForQuestion(question, manifest);
+  const scored = scoreEntriesForQuestion(question, effectiveManifest);
   const retrievalMeta = scored.retrievalMeta || null;
   let picks = scored.filter((x) => x.score > 0).slice(0, maxDocs).map((x) => x.entry);
-  if (picks.length === 0) picks = manifest.entries.slice(0, Math.min(maxDocs, manifest.entries.length));
+  if (picks.length === 0) picks = effectiveManifest.entries.slice(0, Math.min(maxDocs, effectiveManifest.entries.length));
 
   const compactCandidates = scored.length
     ? scored.map((x) => x.entry).slice(0, budget.compactDocs)
-    : manifest.entries.slice(0, Math.min(budget.compactDocs, manifest.entries.length));
+    : effectiveManifest.entries.slice(0, Math.min(budget.compactDocs, effectiveManifest.entries.length));
   let compactList = "";
   for (const e of compactCandidates) {
     const pv =
@@ -923,7 +1171,7 @@ export function buildCorpusAskContext(markdownDir, manifest, question, opts = {}
         : e.preview;
     const line = `- \`${e.path}\`: **${e.title}** — ${pv}\n`;
     if (compactList.length + line.length > maxCompactChars) {
-      compactList += `\n… *[documentenlijst ingekort voor contextlimiet: ${manifest.entries.length} documenten totaal]*\n`;
+      compactList += `\n… *[documentenlijst ingekort voor contextlimiet: ${effectiveManifest.entries.length} documenten totaal]*\n`;
       break;
     }
     compactList += line;
@@ -943,7 +1191,7 @@ export function buildCorpusAskContext(markdownDir, manifest, question, opts = {}
       const headings = e.headings.slice(0, 5).join(" · ");
       hints += `- \`${e.path}\` — **${e.title}**${headings ? ` — koppen: ${headings}` : ""}\n`;
     }
-    const omittedDocs = Math.max(0, manifest.entries.length - compactCandidates.length);
+    const omittedDocs = Math.max(0, effectiveManifest.entries.length - compactCandidates.length);
     const blob =
       `## Gebruikersvraag (corpus / second brain)\n\n${question}\n\n---\n\n` +
       `## Relevante documentroutekaart (${budget.profile}, compact)\n\n${compactList}${
@@ -953,9 +1201,10 @@ export function buildCorpusAskContext(markdownDir, manifest, question, opts = {}
       `### Werkwijze\n\n` +
       `1. Gebruik de compacte routekaart als tokenzuinige start. De hints zijn gerangschikt met BM25-retrieval.\n` +
       `2. Gebruik bij gerichte vragen eerst **read_corpus_outline** met een korte \`query\`, en daarna **read_corpus_section** voor alleen de relevante sectie.\n` +
-      `3. Gebruik **read_corpus_markdown** alleen bij kleine/ongestructureerde documenten of als je echt het volledige bestand nodig hebt.\n` +
+      `3. Gebruik **read_corpus_markdown** alleen bij kleine/ongestructureerde documenten of als outline+section onvoldoende is.\n` +
       `4. Als de vraag vraagt om een overzicht, inventarisatie, vergelijking of "alles"/"hele corpus", lees dan meerdere relevante bestanden/secties in rondes totdat de corpus voldoende is afgedekt.\n` +
-      `5. Als je genoeg hebt gelezen, antwoord dan **uitsluitend** met JSON: \`{"reply":"…"}\` (Nederlands).\n\n` +
+      `5. Antwoord pas wanneer corpus, memory, e-mailmemory en Kanban voldoende zijn meegenomen; verdiep met tools als de baseline onvolledig lijkt.\n` +
+      `6. Als je genoeg hebt gelezen, antwoord dan **uitsluitend** met JSON: \`{"reply":"…"}\` (Nederlands).\n\n` +
       `*Baseer feiten alleen op gelezen bestandsinhoud of op bovenstaande routekaart; verzin niets bij.*`;
 
     const pickedPaths = picks.map((e) => e.path);

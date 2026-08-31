@@ -42,6 +42,11 @@ function activityText(ev: CorpusActivityEvent): string {
   if (ev.phase === "read_memory_section" && ev.path) return `Leest memory-sectie uit ${ev.path}`;
   if (ev.phase === "tool_call" && ev.path) return `Gebruikt ${ev.path}`;
   if (ev.phase === "web_search") return "Zoekt op internet";
+  if (ev.phase === "model_switch" && ev.model) {
+    const role = ev.modelRole || ev.label || "model";
+    return `Model (${role}): ${ev.model}`;
+  }
+  if (ev.model && ev.phase === "thinking") return `${ev.label || "Denkt na"} [${ev.model}]`;
   return ev.path ? `${ev.phase || "Activiteit"}: ${ev.path}` : ev.phase || "Corpus wordt geraadpleegd";
 }
 
@@ -73,7 +78,6 @@ let sessions: AgentChatSession[] = [];
 let activeChatId = "";
 let history: AgentChatTurn[] = [];
 let busy = false;
-let webSearchEnabled = false;
 
 const shell = el("main", "mv-chatonly");
 const header = el("header", "mv-chatonly-header");
@@ -88,14 +92,10 @@ newChatBtn.type = "button";
 const refreshCorpusBtn = el("button", "mv-chatonly-icon-btn", "Corpus");
 refreshCorpusBtn.type = "button";
 refreshCorpusBtn.title = "Corpusinformatie verversen";
-const webSearchBtn = el("button", "mv-chatonly-icon-btn", "Internet");
-webSearchBtn.type = "button";
-webSearchBtn.title = "Internetzoekfunctie aan- of uitzetten";
-webSearchBtn.setAttribute("aria-pressed", "false");
-headerActions.append(sessionSelect, newChatBtn, refreshCorpusBtn, webSearchBtn);
+headerActions.append(sessionSelect, newChatBtn, refreshCorpusBtn);
 header.append(brand, headerActions);
 
-const status = el("div", "mv-chatonly-status", "Ask-only met corpus en long-term memory");
+const status = el("div", "mv-chatonly-status", "Ask-only met corpus, long-term memory en internetzoekfunctie");
 const messages = el("section", "mv-chatonly-messages");
 messages.setAttribute("aria-live", "polite");
 const activity = el("div", "mv-chatonly-activity");
@@ -120,16 +120,11 @@ function setBusy(next: boolean): void {
   sendBtn.disabled = next;
   newChatBtn.disabled = next;
   refreshCorpusBtn.disabled = next;
-  webSearchBtn.disabled = next;
   sessionSelect.disabled = next || sessions.length === 0;
 }
 
 function renderWebSearchState(): void {
-  webSearchBtn.classList.toggle("mv-chatonly-icon-btn--active", webSearchEnabled);
-  webSearchBtn.setAttribute("aria-pressed", webSearchEnabled ? "true" : "false");
-  status.textContent = webSearchEnabled
-    ? "Ask-only met corpus, long-term memory en internetzoekfunctie"
-    : "Ask-only met corpus en long-term memory";
+  status.textContent = "Ask-only met corpus, long-term memory en internetzoekfunctie";
 }
 
 function scrollToBottom(): void {
@@ -278,7 +273,7 @@ async function submitMessage(): Promise<void> {
   history = [...history, { role: "user", content: text, mode: "ask" }];
   renderMessages();
   setBusy(true);
-  status.textContent = webSearchEnabled ? "Denkt na met corpus, memory en internet..." : "Denkt na met corpus en memory...";
+  status.textContent = "Denkt na met corpus, memory en internet...";
   try {
     await persistActiveChat(wasEmpty ? chatTitleFrom(text) : undefined);
     const result = await agentChat(
@@ -288,7 +283,7 @@ async function submitMessage(): Promise<void> {
         markdown: "",
         history,
         corpusWide: true,
-        ...(webSearchEnabled ? { webSearch: true } : {}),
+        webSearch: true,
         activityStream: true,
         replyMarkdown: true,
       },
@@ -334,10 +329,6 @@ input.addEventListener("keydown", (event) => {
 
 newChatBtn.addEventListener("click", () => void startNewChat());
 refreshCorpusBtn.addEventListener("click", () => void refreshCorpus());
-webSearchBtn.addEventListener("click", () => {
-  webSearchEnabled = !webSearchEnabled;
-  renderWebSearchState();
-});
 sessionSelect.addEventListener("change", () => void switchSession(sessionSelect.value));
 
 void loadSessions();

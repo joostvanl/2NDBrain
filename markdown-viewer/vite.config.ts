@@ -2,6 +2,7 @@ import "./server/load-env.mjs";
 import { defineConfig } from "vite";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { apiRestartGatePlugin, configureApiProxyResilience } from "./vite/api-restart-proxy.mjs";
 
 const apiPort = Number(process.env.API_PORT || 8787);
 const rootDir = fileURLToPath(new URL(".", import.meta.url));
@@ -78,7 +79,7 @@ function iomsBasicAuthPlugin() {
  */
 export default defineConfig({
   root: ".",
-  plugins: [iomsBasicAuthPlugin()],
+  plugins: [apiRestartGatePlugin(apiPort), iomsBasicAuthPlugin()],
   build: {
     rollupOptions: {
       input: {
@@ -95,9 +96,10 @@ export default defineConfig({
       "/api": {
         target: `http://127.0.0.1:${apiPort}`,
         changeOrigin: true,
-        /** Grote Markdown + Word-generatie mag langer duren dan de default proxy-timeout. */
-        timeout: 120_000,
-        proxyTimeout: 120_000,
+        /** Lange agent-/gespreksverslag-runs (toolcontext + review) mogen niet door proxy-timeout vallen. */
+        timeout: 300_000,
+        proxyTimeout: 300_000,
+        configure: (proxy) => configureApiProxyResilience(proxy),
       },
     },
   },

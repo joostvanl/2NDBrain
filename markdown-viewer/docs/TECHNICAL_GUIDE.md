@@ -52,6 +52,20 @@ markdown-viewer/
   server/
     index.mjs          # Express-app, alle API-routes, LLM-calls, docx-import
     corpus-index.mjs   # Herbruikbare indexer voor werkdocumenten en Files/.memory/
+    nexus/             # Nexus-orkestratie (intent, cache, evidence, patches, templates)
+      nexus-intent.mjs
+      nexus-run-cache.mjs
+      nexus-evidence.mjs
+      nexus-source-policy.mjs
+      nexus-patch.mjs
+      nexus-template-profiles.mjs
+      nexus-protected-paths.mjs
+      nexus-activity-overview.mjs
+      nexus-critical-threads.mjs
+      nexus-tool-bridge.mjs
+      nexus-voice.mjs
+      nexus-viewer-context.mjs
+      nexus-protected-paths.json
     load-env.mjs       # Laadt .env / .env.local naar process.env
     docx_export_bridge.py  # Fallback Python-bridge voor export (als HTTP-export niet)
   scripts/
@@ -105,8 +119,34 @@ Geladen via `server/load-env.mjs` vanuit `markdown-viewer/.env` en `.env.local` 
 | `WEB_SEARCH_MAX_RESULTS` | Max. Tavily-resultaten per `web_search` toolcall (default **5**, max **10**) |
 | `WEB_SEARCH_TIMEOUT_MS` | Timeout voor Tavily-calls (default **15000**) |
 | `WEB_SEARCH_RESULT_MAX_CHARS` | Max. tekens per webresultaat/snippet richting LLM (default **4000**) |
+| `NEXUS_EXPERIMENT_PATHS` | Komma-gescheiden padsegmenten die uit corpus-BM25 worden gefilterd (default `90-experiments-en-test`) |
+| `NEXUS_TOOL_CACHE` | Zet op `0` om per-run toolresultaat-cache uit te zetten (default aan) |
+| `NEXUS_STRUCTURED_EVIDENCE` | Zet op `0`/`1` om structured evidence JSON in toolcontext te forceren/uit te zetten |
+| `MODEL_ROUTER_EXPLORATION_RATE` | Kans (0–0.25) dat Auto-router het 2e/3e model probeert i.p.v. top-score (default **0.08**) |
+| `MODEL_ROUTER_DATA_DIR` | Map voor `model-router-events.jsonl` en `model-router-scores.json` (default `markdown-viewer/data/`) |
+| `MODEL_CATALOG_OVERRIDES_PATH` | Pad naar `model-catalog.overrides.json` voor handmatige capability-correcties |
 
 Zie ook `.env.example` voor Word-export-varianten.
+
+### 4.1 Nexus-orkestratie
+
+De server classificeert elke Ask/Agent-vraag (`classifyNexusIntent` in `server/nexus/nexus-intent.mjs`) en past daar retrieval-budget, toolgroepen en experiment-filters op toe. Belangrijkste flows:
+
+- **Auto model-router** — Kies in Instellingen model **Auto (slim routeren)**. De server laadt een modelcatalogus (`GET /api/agent/models/catalog`), kiest per LLM-fase (`strategy`, `retrieval`, `synthesis`, `review`, `simple`, `utility`) het beste model op basis van capabilities + geleerde scores (`nexus-model-router.mjs`, `nexus-model-learning.mjs`). Modelswitches verschijnen in de chat-activitystream als `Model (strategie/ophalen/antwoord): …`. Router-statistieken: `GET /api/agent/models/router-stats`.
+
+- **Heuristische baseline** — `buildNexusHeuristicSnapshot()` prefetcht BM25-routekaart, e-mailmemory, Kanban en secties uit het open document.
+- **Toolcontext (agent-modus)** — `callCorpusAskAgentWithTools()` met structured evidence (`evidence[]`, `assumptions[]`) vóór de review-agent.
+- **Patches** — `applyPatchesToMarkdown()` ondersteunt optioneel `sectionId`, `beforeSnippet` en `rationale`; beschermde paden via `nexus-protected-paths.json`.
+- **Kanban-dedup** — `create_kanban_task` vereist eerst `search_kanban_tasks` in dezelfde run.
+- **Stem Nexus** — `nexus-voice.mjs` injecteert persona in alle LLM-system prompts; chat heeft optioneel voorlezen via `src/nexus/speech.ts` (Web Speech API, nl-NL).
+- **Viewercontext** — `nexus-viewer-context.mjs` + `openDocumentPath`/`activeView` in chat-request: Nexus weet welk bestand open is (ook vanuit e-mail/Kanban-weergave).
+
+**Handmatige smoke-checklist (agent-modus):**
+
+1. Paragraaf-edit in DAP-template → section-scoped patch zonder cross-section match.
+2. SLA-vraag met experiment-notitie vs standaard → hogere bron-tier wint in evidence-block.
+3. Planning-vraag “wat moet ik deze week” → activity overview in baseline, geen dubbele toolcalls (debug log).
+4. Patch op protected path met `replaceAll` → geweigerd met duidelijke foutmelding.
 
 ---
 
@@ -117,7 +157,9 @@ Alle paden hangen onder **`/api`** (behalve statische assets in productie).
 | Methode | Pad | Korte beschrijving |
 |---------|-----|-------------------|
 | GET | `/api/health` | `{ ok, handlerRev }` — `handlerRev` = string in code; gebruik om te verifiëren welke serverbuild draait |
-| GET/POST | `/api/agent-config` | Publieke configuratie (geen apiKey in response); POST slaat `agent.config.json` |
+| GET/POST | `/api/agent-config` | Publieke configuratie (geen apiKey in response); POST slaat `agent.config.json`; ondersteunt `model: "auto"` en `modelRouter` |
+| GET | `/api/agent/models/catalog` | Verrijkte modelcatalogus voor Auto-router |
+| GET | `/api/agent/models/router-stats` | Geleerde scores per fase/model |
 | GET/DELETE | `/api/agent/logs` | Ringbuffer agentlog server-side |
 | POST | `/api/agent-models` | Haalt beschikbare OpenAI-compatible modellen op via de geconfigureerde endpoint/API key voor de modeldropdown in instellingen |
 | GET | `/api/markdown-files` | Index: `files`, `folders`, `fileDetails`, `directory` |

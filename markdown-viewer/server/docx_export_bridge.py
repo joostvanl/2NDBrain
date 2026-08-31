@@ -14,7 +14,7 @@ from typing import Any
 
 def main() -> None:
     try:
-        raw = sys.stdin.read()
+        raw = sys.stdin.buffer.read().decode("utf-8")
         data: dict[str, Any] = json.loads(raw) if raw.strip() else {}
         markdown_content = str(data.get("markdown_content", ""))
         template_name = str(data.get("template_name", ""))

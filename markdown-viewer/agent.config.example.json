@@ -1,5 +1,9 @@
 {
-  "apiKey": "sk-uBeFRn9elTYvhpsV1Y6DQw",
+  "apiKey": "sk-your-key",
   "endpoint": "https://api-v2.bonzai.iodigital.com",
-  "model": "gpt-4o-mini"
+  "model": "auto",
+  "modelRouter": {
+    "explorationRate": 0.08,
+    "enableStrategyPhase": true
+  }
 }

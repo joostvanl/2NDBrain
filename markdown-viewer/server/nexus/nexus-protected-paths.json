@@ -1,0 +1,12 @@
+{
+  "patterns": [
+    "01-managed-services/SLA Standaarden/",
+    "01-managed-services/DAP template/",
+    "01-managed-services/SLA Standaarden\\",
+    "01-managed-services/DAP template\\"
+  ],
+  "rules": {
+    "blockReplaceAll": true,
+    "requireRationale": true
+  }
+}

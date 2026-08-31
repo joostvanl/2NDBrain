@@ -3,3 +3,6 @@ agent.config
 .tmp/
 .env
 .env.local
+data/
+.confluence-edge-profile/
+server/__pycache__/

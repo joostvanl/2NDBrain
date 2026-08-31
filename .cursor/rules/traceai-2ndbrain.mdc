@@ -1,0 +1,23 @@
+---
+description: Bind this workspace to TraceAI project 2ndBrain
+alwaysApply: true
+---
+
+# TraceAI — 2ndBrain
+
+This Cursor workspace (`iOMS`) is linked to TraceAI project **2ndBrain**.
+
+- **Slug:** `2ndbrain`
+- **Key:** `2ND`
+- **Workflow:** `2ndbrain-standard-worker`
+- **Board:** https://traceai.joostvanleeuwaarden.com/projects/2ndbrain
+- **Handbook:** start at wiki `getting-started` (via TraceAI MCP `get_wiki_page`)
+
+## Required agent behaviour
+
+1. Manage tasks only via TraceAI MCP for project `2ndbrain` (not `traceai`, `cms-tech-debt`, or `vantage`).
+2. Call `get_project` (`slug: 2ndbrain`) or `get_workflow` before creating/transitioning tickets; follow `agent_playbook` and stage guidelines.
+3. Ticket descriptions: thin playbook with `## Context`, `## Goal`, `## What to implement`, `## Acceptance criteria`. Put rich design in wiki design packs.
+4. Every `transition_ticket`: Markdown comment with `## Vorige stap` and `## Deze stap`, plus `tokens_used` when required.
+5. Human-gated stages: wait for TraceUI Goedkeuren/Afkeuren, then transition.
+6. Wiki writes only via TraceAI MCP — never Aurora MCP for tickets/wiki.

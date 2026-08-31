@@ -11,6 +11,7 @@ import {
   retrievalBudgetForQuestion,
   scoreEntriesForQuestion,
   scoreMarkdownSectionsForQuestion,
+  filterManifestEntries,
   unlinkedMentionSuggestionsFromManifest,
 } from "../server/corpus-index.mjs";
 
@@ -211,4 +212,16 @@ test("linkUnlinkedMentionsInMarkdown repairs escaped links before applying sugge
   assert.equal(result.repairedCount, 1);
   assert.equal(result.changed, true);
   assert.equal(result.content, "Context voor [managed services](90-experiments-en-test/Managed Services.md)-accounts.");
+});
+
+test("filterManifestEntries excludes experiment paths", () => {
+  const manifest = {
+    entries: [
+      { path: "01-managed-services/SLA.md", title: "SLA", preview: "" },
+      { path: "90-experiments-en-test/Nexus optimalisaties.md", title: "Exp", preview: "" },
+    ],
+  };
+  const filtered = filterManifestEntries(manifest, ["90-experiments-en-test"]);
+  assert.equal(filtered.entries.length, 1);
+  assert.equal(filtered.entries[0].path, "01-managed-services/SLA.md");
 });

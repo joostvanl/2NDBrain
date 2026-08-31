@@ -99,10 +99,11 @@ export function threadMessageCount(c: ReviewComment): number {
   return 1 + c.replies.length;
 }
 
-/** Herkenning van een door de agent geplaatste reply (Akkoord / Niet akkoord in de viewer). */
+/** Herkenning van een door Nexus/agent geplaatste reply (Akkoord / Niet akkoord in de viewer). */
 export function isAgentReviewAuthor(author: string): boolean {
   const t = author.trim();
   if (!t) return false;
+  if (/^nexus$/i.test(t)) return true;
   return /\bagent\b/i.test(t);
 }
 

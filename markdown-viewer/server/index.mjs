@@ -77,6 +77,12 @@ import {
   diagnoseConfluenceAuth,
   resetConfluenceGatewaySession,
 } from "./nexus/nexus-confluence.mjs";
+import {
+  jiraConfigPayload,
+  probeJiraSsoIntercept,
+  readJiraIssue,
+  searchJiraIssues,
+} from "./nexus/nexus-jira.mjs";
 import { buildModelCatalog, phaseLabelNl } from "./nexus/nexus-model-catalog.mjs";
 import {
   createModelTrace,
@@ -150,7 +156,7 @@ import { createKanbanCommentsStore } from "./kanban-comments.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.join(__dirname, "..");
 /** Verhoog bij relevante API-gedragswijzigingen; controleer met GET /api/health of je de juiste server draait. */
-const API_HANDLER_REVISION = "2026-05-28-agent-activity-log-tool";
+const API_HANDLER_REVISION = "2026-09-01-jira-jql-detect";
 const MARKDOWN_DIR = process.env.MARKDOWN_DIR || path.join(rootDir, "..", "Files");
 const MEMORY_DIR = process.env.MEMORY_DIR || path.join(MARKDOWN_DIR, MEMORY_DIRNAME);
 const CRITICAL_THREADS_PATH =
@@ -4855,6 +4861,9 @@ function nexusOptionalSourceHints(message) {
   if (/\b(confluence|atlassian|domeinpagina|service management|probleembeheer)\b/.test(text)) {
     hints.push("search_confluence + read_confluence_page");
   }
+  if (/\b(jira|jql)\b/.test(text) || /\b[A-Z][A-Z0-9_]+-\d+\b/.test(message)) {
+    hints.push("search_jira + read_jira_issue");
+  }
   if (/\b(actueel|recent nieuws|internet|web\b|online|tavily|google|markt|koers)\b/.test(text)) {
     hints.push("web_search");
   }
@@ -7388,6 +7397,67 @@ const CONFLUENCE_TOOLS = [
   },
 ];
 
+const JIRA_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "search_jira",
+      description:
+        "Doorzoek Jira (niet het interne Actie-Kanban). Zet echte JQL altijd in `jql` (niet in `query`). Strings met project =, AND, ORDER BY of updated/created gelden als JQL, ook als ze per ongeluk in `query` staan. `query` is alleen vrije tekst of een issue-key.",
+      parameters: {
+        type: "object",
+        properties: {
+          jql: {
+            type: "string",
+            description: "Volledige JQL, bijvoorbeeld project = STANLEYST_0003 AND updated >= 2026-08-01 AND updated <= 2026-08-31 ORDER BY updated DESC.",
+          },
+          query: {
+            type: "string",
+            description: "Alleen vrije zoektekst of een issue-key. Geen JQL hier; gebruik daarvoor jql.",
+          },
+          maxResults: {
+            type: "number",
+            description: "Maximaal aantal issues in deze pagina (1-100). Voor maandrapportages 50-100; kijk naar total en nextStartAt.",
+          },
+          startAt: {
+            type: "number",
+            description: "Offset voor de volgende pagina. Gebruik nextStartAt uit het vorige zoekresultaat tot je total hebt.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor het activiteitenlog.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_jira_issue",
+      description:
+        "Lees één Jira-issue (summary, status, description, recente comments, browse-URL). Gebruik na search_jira of wanneer de gebruiker een issue-key/URL geeft. Dit is niet Actie-Kanban.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            description: "Issue-key zoals DHLEXC-376.",
+          },
+          url: {
+            type: "string",
+            description: "Jira browse-URL als de key niet los gegeven is.",
+          },
+          reason: {
+            type: "string",
+            description: "Korte reden voor het activiteitenlog.",
+          },
+        },
+      },
+    },
+  },
+];
+
 const OUTLOOK_TOOLS = [
   {
     type: "function",
@@ -8100,6 +8170,7 @@ function askToolsForOptions(opts = {}) {
   if (opts.enableTimesheet) tools.push(...TIMESHEET_TOOLS);
   if (opts.enableWebSearch) tools.push(...WEB_SEARCH_TOOLS);
   if (opts.enableConfluence) tools.push(...CONFLUENCE_TOOLS);
+  if (opts.enableJira) tools.push(...JIRA_TOOLS);
   if (opts.enableOutlook) tools.push(...OUTLOOK_TOOLS);
   return tools;
 }
@@ -8138,6 +8209,7 @@ async function callCorpusAskAgentWithTools(
     enableActivityLogs;
   const enableConfluence =
     corpusOpts.enableConfluence !== false && (fromIntent.enableConfluence !== false || !intentGroups);
+  const enableJira = corpusOpts.enableJira !== false && (fromIntent.enableJira !== false || !intentGroups);
   const enableOutlook =
     (corpusOpts.enableOutlook === true || (corpusOpts.enableOutlook !== false && fromIntent.enableOutlook === true)) &&
     OUTLOOK_TOOLS_ENABLED;
@@ -8158,6 +8230,7 @@ async function callCorpusAskAgentWithTools(
     enableActivityLogs,
     enableTimesheet,
     enableConfluence,
+    enableJira,
     enableOutlook,
     enableMemoryWriteTools,
     enableWorkDocumentTools,
@@ -8277,6 +8350,9 @@ async function callCorpusAskAgentWithTools(
     (enableConfluence
       ? "Je hebt ook Confluence-tools via de gekoppelde browser-sessie: **search_confluence** om pagina's te vinden, **read_confluence_page** om een pagina op te halen en **write_confluence_page** om een bestaande pagina terug te schrijven. Gebruik search_confluence wanneer de gebruiker vraagt naar Confluence-inhoud zonder pageId/URL. Lees daarna met read_confluence_page voordat je conclusies trekt. Gebruik write_confluence_page alleen als de gebruiker expliciet vraagt om een Confluence-pagina te wijzigen; lees eerst de actuele versie. Noem de Confluence-pagina-URL als bron. "
       : "") +
+    (enableJira
+      ? "Je hebt ook read-only Jira-tools: **search_jira** en **read_jira_issue**. Zet JQL altijd in parameter `jql` (bijv. project = STANLEYST_0003 AND updated >= 2026-08-01 AND updated <= 2026-08-31). Parameter `query` is alleen vrije tekst of een issue-key; stop daar geen JQL in. Kijk naar `total` en `jql` in het toolresultaat: als total 0 is terwijl de gebruiker tickets ziet, zat de JQL waarschijnlijk in `query`. Voor rapportages: maxResults tot 100 en pagina verder via startAt/nextStartAt. Dit is niet het interne Actie-Kanban. Lees na search de relevante issues met read_jira_issue voordat je een analyse maakt. Noem de Jira browse-URL als bron. Schrijf niets terug naar Jira. "
+      : "") +
     (enableOutlook
       ? "Je hebt ook lokale Outlook-tools via klassieke Outlook Desktop: **search_outlook_calendar** voor agenda/afspraken uit de hoofdagenda, **search_2ndbrain_calendar** voor de door iOMS beheerde agenda, **create_2ndbrain_calendar_event** om uitsluitend in de 2ndbrain-agenda te schrijven, **update_2ndbrain_calendar_event** om bestaande 2ndbrain-afspraken te verplaatsen of bij te werken, **search_outlook_mail** voor inbox/verzonden/concept-mail (folder=inbox, sent of drafts), **read_outlook_mail** voor één gevonden mail en **create_outlook_draft** om een conceptmail aan te maken. Gebruik kalender-tools wanneer de gebruiker vraagt naar agenda, afspraken, planning of beschikbaarheid. Gebruik live mail-tools wanneer de gebruiker expliciet naar actuele e-mailinhoud vraagt, wanneer search_email_memory onvoldoende bewijs geeft, of wanneer je een concept/reply moet maken op een specifieke mail. Zoek met korte kernwoorden/namen; de tools scoren fuzzy/token-based. Als een datumrange uit de vraag volgt, zet relatieve en Nederlandse datums expliciet om naar ISO YYYY-MM-DD of volledige ISO timestamps; gebruik nooit ambigu 08-06/06-08. Als een datumrange ontbreekt, zoek eerst met de backend-defaults (mail: laatste 90 dagen; agenda: 30 dagen terug tot 120 dagen vooruit) en vraag pas om verduidelijking als dat leeg of te breed blijft. Belangrijk: schrijf, verplaats of wijzig nooit items in de hoofdagenda; alle agenda-schrijf- en update-acties gaan uitsluitend via create_2ndbrain_calendar_event of update_2ndbrain_calendar_event naar de 2ndbrain-agenda. Voor verplaatsen of wijzigen: zoek eerst met search_2ndbrain_calendar, kies exact één item, en gebruik de entryId uit dat zoekresultaat. Lees volledige mailbody alleen als dat nodig is voor de vraag; begin anders met zoekresultaten/snippets of search_email_memory. Gebruik create_outlook_draft alleen wanneer de gebruiker expliciet vraagt om een conceptmail/maildraft te maken; deze tool verzendt nooit. Bij het schrijven van een mail of plannen van een 2ndbrain-afspraak gebruik je eerst de relevante kennisbronnen: huidige document, corpus/geheugen en waar nodig Outlook, Confluence of web_search. Als ontvanger, tijdslot of kernboodschap onzeker is, vraag eerst om verduidelijking. Noem Outlook-resultaten als lokale Outlook-bron, niet als serverbron. "
       : "") +
@@ -8385,6 +8461,8 @@ async function callCorpusAskAgentWithTools(
       const hasActivityLogs = fnNames.includes("read_activity_logs");
       const hasConfluenceSearch = fnNames.includes("search_confluence");
       const hasConfluence = fnNames.includes("read_confluence_page") || hasConfluenceSearch;
+      const hasJiraSearch = fnNames.includes("search_jira");
+      const hasJira = fnNames.includes("read_jira_issue") || hasJiraSearch;
       const hasOutlookDraft = fnNames.includes("create_outlook_draft");
       const hasManagedCalendarWrite = fnNames.includes("create_2ndbrain_calendar_event");
       const hasManagedCalendarUpdate = fnNames.includes("update_2ndbrain_calendar_event");
@@ -8409,6 +8487,9 @@ async function callCorpusAskAgentWithTools(
         fetchLabel = `${toolCalls.length} Confluence-zoek-/leesactie(s)…`;
       } else if (hasConfluenceSearch) fetchLabel = `${toolCalls.length} Confluence-zoekopdracht(en)…`;
       else if (hasConfluence) fetchLabel = `${toolCalls.length} Confluence-pagina('s) ophalen…`;
+      else if (hasJiraSearch && fnNames.includes("read_jira_issue")) fetchLabel = `${toolCalls.length} Jira-zoek-/leesactie(s)…`;
+      else if (hasJiraSearch) fetchLabel = `${toolCalls.length} Jira-zoekopdracht(en)…`;
+      else if (hasJira) fetchLabel = `${toolCalls.length} Jira-issue(s) ophalen…`;
       else if (hasActivityLogs) fetchLabel = `${toolCalls.length} activity-logactie(s)…`;
       else if (hasWebSearch && (hasRead || hasReadMemory || hasReadOutline || hasReadSection || hasCreate)) {
         fetchLabel = `${toolCalls.length} corpus-/webactie(s)…`;
@@ -9098,6 +9179,59 @@ async function callCorpusAskAgentWithTools(
             pageId,
             ok: payload.ok,
             version: payload.ok ? payload.version : undefined,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(payload),
+          });
+          continue;
+        }
+
+        if (fnName === "search_jira") {
+          const jql = typeof args.jql === "string" ? args.jql.trim() : "";
+          const query = typeof args.query === "string" ? args.query.trim() : "";
+          const maxResults = Number(args.maxResults || 20);
+          const startAt = Number(args.startAt || 0);
+          pushActivity({
+            phase: "jira_search",
+            label: "Jira doorzoeken",
+            detail: reason || jql || query || undefined,
+          });
+          const payload = await searchJiraIssues({ jql, query, maxResults, startAt });
+          performanceMetrics.retrievedChars += payload.ok ? JSON.stringify(payload.results || []).length : 0;
+          agentLog(runId, "jira_tool_search", {
+            jql: truncStr(jql || query, 240),
+            ok: payload.ok,
+            resultCount: Array.isArray(payload.results) ? payload.results.length : 0,
+            ssoIntercept: payload.ssoIntercept === true,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              ...payload,
+              userFacingInstruction:
+                "Gebruik search-resultaten om issues te kiezen. Lees inhoudelijke tickets daarna met read_jira_issue voordat je een analyse of rapportage maakt. Dit is Jira, niet Actie-Kanban.",
+            }),
+          });
+          continue;
+        }
+
+        if (fnName === "read_jira_issue") {
+          const key = typeof args.key === "string" ? args.key.trim() : "";
+          const issueUrl = typeof args.url === "string" ? args.url.trim() : "";
+          pushActivity({
+            phase: "jira_read",
+            label: "Jira-issue ophalen",
+            detail: reason || key || issueUrl || undefined,
+          });
+          const payload = await readJiraIssue({ key, url: issueUrl });
+          performanceMetrics.retrievedChars += payload.ok ? JSON.stringify(payload).length : 0;
+          agentLog(runId, "jira_tool_read", {
+            key: payload.key || key,
+            ok: payload.ok,
+            ssoIntercept: payload.ssoIntercept === true,
           });
           messages.push({
             role: "tool",
@@ -10070,6 +10204,24 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/confluence/config", (_req, res) => {
   res.json({ ok: true, ...confluenceConfigPayload() });
+});
+
+app.get("/api/jira/status", async (_req, res) => {
+  try {
+    const payload = jiraConfigPayload();
+    res.json({ ok: true, ...payload });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/jira/probe-sso", async (_req, res) => {
+  try {
+    const probe = await probeJiraSsoIntercept();
+    res.status(probe.ok ? 200 : 502).json(probe);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 app.get("/api/confluence/test", async (req, res) => {

@@ -2,10 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   browserSessionSyncEnabled,
+  clearBrowserSyncedCookie,
   discoverCdpEndpointCandidates,
   filterRelevantConfluenceCookies,
   formatCookiesForHeader,
+  formatCookiesForUrl,
   mergeConfluenceCookieHeaders,
+  rememberBrowserSyncedCookies,
+  resolveBrowserCookieHeaderForUrl,
   selectCdpPageTarget,
 } from "../server/nexus/nexus-confluence-browser-session.mjs";
 
@@ -42,6 +46,48 @@ test("selectCdpPageTarget prefers a Confluence tab over DevTools or other pages"
     { type: "page", url: "https://confluence.hosted-tools.com/wiki", webSocketDebuggerUrl: "ws://c" },
   ]);
   assert.equal(target?.webSocketDebuggerUrl, "ws://c");
+});
+
+test("selectCdpPageTarget can prefer a Jira tab when asked", () => {
+  const target = selectCdpPageTarget(
+    [
+      { type: "page", url: "https://confluence.hosted-tools.com/wiki", webSocketDebuggerUrl: "ws://c" },
+      { type: "page", url: "https://jira.hosted-tools.com/browse/ABC-1", webSocketDebuggerUrl: "ws://j" },
+    ],
+    "jira.hosted-tools.com",
+  );
+  assert.equal(target?.webSocketDebuggerUrl, "ws://j");
+});
+
+test("formatCookiesForUrl keeps Jira session cookies separate from Confluence", () => {
+  const cookies = [
+    { name: "hosted-tools-auth-2", value: "conf-auth", domain: "confluence.hosted-tools.com" },
+    { name: "JSESSIONID", value: "conf-session", domain: "confluence.hosted-tools.com" },
+    { name: "hosted-tools-auth-2", value: "jira-auth", domain: "jira.hosted-tools.com" },
+    { name: "JSESSIONID", value: "jira-session", domain: "jira.hosted-tools.com" },
+    { name: "atlassian.xsrf.token", value: "jira-xsrf", domain: "jira.hosted-tools.com" },
+  ];
+  const jiraHeader = formatCookiesForUrl(cookies, "https://jira.hosted-tools.com/rest/api/2/myself");
+  assert.match(jiraHeader, /JSESSIONID=jira-session/);
+  assert.match(jiraHeader, /hosted-tools-auth-2=jira-auth/);
+  assert.doesNotMatch(jiraHeader, /conf-session/);
+  assert.doesNotMatch(jiraHeader, /conf-auth/);
+  const confluenceHeader = formatCookiesForUrl(cookies, "https://confluence.hosted-tools.com/rest/api/user/current");
+  assert.match(confluenceHeader, /JSESSIONID=conf-session/);
+  assert.doesNotMatch(confluenceHeader, /jira-session/);
+});
+
+test("resolveBrowserCookieHeaderForUrl uses structured host cookies", () => {
+  rememberBrowserSyncedCookies([
+    { name: "JSESSIONID", value: "conf-session", domain: "confluence.hosted-tools.com" },
+    { name: "JSESSIONID", value: "jira-session", domain: "jira.hosted-tools.com" },
+  ]);
+  try {
+    const header = resolveBrowserCookieHeaderForUrl("https://jira.hosted-tools.com/rest/api/2/search", {});
+    assert.equal(header, "JSESSIONID=jira-session");
+  } finally {
+    clearBrowserSyncedCookie();
+  }
 });
 
 test("filterRelevantConfluenceCookies keeps hosted-tools and Azure AD cookies", () => {

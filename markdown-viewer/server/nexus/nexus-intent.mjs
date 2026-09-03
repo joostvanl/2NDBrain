@@ -126,6 +126,11 @@ export function classifyNexusIntent(message, context = {}) {
     webSearch: profile === "research" || profile === "communication",
     activityLogs: profile === "planning",
     confluence: profile === "research" || profile === "document-edit",
+    jira:
+      profile === "research" ||
+      /\bjira\b/i.test(text) ||
+      /\bjql\b/i.test(text) ||
+      /\b[A-Z][A-Z0-9_]+-\d+\b/.test(text),
     outlook: profile === "communication" || profile === "planning",
     memoryWrite: profile === "research" || profile === "planning",
   };
@@ -170,6 +175,7 @@ export function toolGroupsToCorpusOpts(enabledToolGroups = {}) {
     enableWebSearch: enabledToolGroups.webSearch === true,
     enableActivityLogs: enabledToolGroups.activityLogs === true,
     enableConfluence: enabledToolGroups.confluence !== false,
+    enableJira: enabledToolGroups.jira !== false,
     enableOutlook: enabledToolGroups.outlook === true,
     enableMemoryWriteTools: enabledToolGroups.memoryWrite === true,
   };

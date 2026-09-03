@@ -15,6 +15,7 @@ const EDGE_PROFILE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)),
 const DEFAULT_CONFLUENCE_URL = "https://confluence.hosted-tools.com";
 
 let cachedBrowserCookie = "";
+let cachedBrowserCookies = [];
 let lastSyncAt = "";
 let lastSyncError = "";
 let lastSyncSource = "";
@@ -36,9 +37,14 @@ export function getBrowserSyncedCookie() {
 
 export function clearBrowserSyncedCookie() {
   cachedBrowserCookie = "";
+  cachedBrowserCookies = [];
   lastSyncAt = "";
   lastSyncError = "";
   lastSyncSource = "";
+}
+
+export function getCachedBrowserCookies() {
+  return cachedBrowserCookies.slice();
 }
 
 export function browserSessionStatus(env = process.env) {
@@ -64,15 +70,21 @@ function normalizeCdpBase(raw) {
   return trimEnv(raw).replace(/\/json(?:\/.*)?$/i, "").replace(/\/+$/, "");
 }
 
-export function selectCdpPageTarget(targets = []) {
+export function selectCdpPageTarget(targets = [], preferHost = "") {
   const pages = targets.filter(
     (target) =>
       target?.type === "page" &&
       target.webSocketDebuggerUrl &&
       !String(target.url || "").startsWith("devtools://"),
   );
+  const needle = String(preferHost || "").toLowerCase();
+  if (needle) {
+    const preferred = pages.find((target) => String(target.url || "").toLowerCase().includes(needle));
+    if (preferred) return preferred;
+  }
   return (
     pages.find((target) => String(target.url || "").includes("confluence.hosted-tools.com")) ||
+    pages.find((target) => String(target.url || "").includes("jira.hosted-tools.com")) ||
     pages.find((target) => String(target.url || "").includes("hosted-tools.com")) ||
     pages[0] ||
     null
@@ -85,6 +97,7 @@ export function filterRelevantConfluenceCookies(cookies = []) {
     return (
       hay.includes("hosted-tools") ||
       hay.includes("confluence") ||
+      hay.includes("jira") ||
       hay.includes("atlassian") ||
       hay.includes("microsoftonline") ||
       hay.includes("login.microsoft")
@@ -111,6 +124,62 @@ export function formatCookiesForHeader(cookies = []) {
   return Array.from(jar.entries())
     .map(([name, value]) => `${name}=${value}`)
     .join("; ");
+}
+
+export function cookieMatchesUrl(cookie, urlString) {
+  if (!cookie || !urlString) return false;
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return false;
+  }
+  const host = url.hostname.toLowerCase();
+  const rawDomain = String(cookie.domain || "").toLowerCase();
+  const allowSubdomains = rawDomain.startsWith(".");
+  const domain = rawDomain.replace(/^\./, "") || host;
+  if (allowSubdomains) {
+    if (host !== domain && !host.endsWith(`.${domain}`)) return false;
+  } else if (host !== domain) {
+    return false;
+  }
+  const path = cookie.path || "/";
+  const reqPath = url.pathname || "/";
+  if (path !== "/" && reqPath !== path && !reqPath.startsWith(path.endsWith("/") ? path : `${path}/`)) {
+    return false;
+  }
+  return true;
+}
+
+export function formatCookiesForUrl(cookies = [], urlString = "") {
+  const jar = new Map();
+  for (const cookie of cookies) {
+    const name = trimEnv(cookie?.name);
+    if (!name || !cookieMatchesUrl(cookie, urlString)) continue;
+    const domain = String(cookie.domain || "").replace(/^\./, "");
+    const specificity = domain.length;
+    const existing = jar.get(name);
+    if (!existing || specificity >= existing.specificity) {
+      jar.set(name, { value: String(cookie.value ?? ""), specificity });
+    }
+  }
+  return Array.from(jar.entries())
+    .map(([name, item]) => `${name}=${item.value}`)
+    .join("; ");
+}
+
+export function rememberBrowserSyncedCookies(cookies, source = "manual") {
+  cachedBrowserCookies = Array.isArray(cookies) ? cookies.filter((item) => trimEnv(item?.name)) : [];
+  rememberBrowserSyncedCookie(formatCookiesForHeader(cachedBrowserCookies), source);
+}
+
+export function resolveBrowserCookieHeaderForUrl(urlString, env = process.env) {
+  primeBrowserCookieFromDisk(env);
+  const structured = getCachedBrowserCookies();
+  if (structured.length && urlString) {
+    return formatCookiesForUrl(structured, urlString);
+  }
+  return getBrowserSyncedCookie();
 }
 
 function cookieFilePath(env = process.env) {
@@ -161,12 +230,12 @@ async function fetchJson(url, timeoutMs = 2000) {
   }
 }
 
-async function resolveCdpEndpoint(env = process.env) {
+async function resolveCdpEndpoint(env = process.env, preferHost = "") {
   for (const base of discoverCdpEndpointCandidates(env)) {
     const version = await fetchJson(`${base}/json/version`);
     if (!version) continue;
     const targets = (await fetchJson(`${base}/json`)) || [];
-    const page = selectCdpPageTarget(targets);
+    const page = selectCdpPageTarget(targets, preferHost);
     const webSocketDebuggerUrl = page?.webSocketDebuggerUrl || version.webSocketDebuggerUrl;
     if (!webSocketDebuggerUrl) continue;
     return {
@@ -312,24 +381,27 @@ export async function startConfluenceDebugEdge(env = process.env) {
   return { ok: false, error: `Edge is gestart maar CDP op ${port} kwam niet omhoog.` };
 }
 
-export async function syncConfluenceBrowserSession(env = process.env) {
+export async function syncConfluenceBrowserSession(env = process.env, { preferHost = "" } = {}) {
   if (!browserSessionSyncEnabled(env)) {
     return { ok: false, cookie: "", error: "Browser-sessiesync is uitgeschakeld (CONFLUENCE_BROWSER_SESSION=0)." };
   }
 
   const baseUrl = normalizeConfluenceBaseUrl(env.CONFLUENCE_BASE_URL);
+  const jiraBase = trimEnv(env.JIRA_BASE_URL).replace(/\/+$/, "");
   const urls = Array.from(
     new Set(
       [
         baseUrl,
         DEFAULT_CONFLUENCE_URL,
+        jiraBase,
+        "https://jira.hosted-tools.com",
         "https://auth.hosted-tools.com",
         "https://login.microsoftonline.com",
       ].filter(Boolean),
     ),
   );
 
-  const endpoint = await resolveCdpEndpoint(env);
+  const endpoint = await resolveCdpEndpoint(env, preferHost);
   if (!endpoint) {
     lastSyncError = browserSessionHelpText(env);
     return { ok: false, cookie: "", error: lastSyncError, cdpAvailable: false };
@@ -354,7 +426,7 @@ export async function syncConfluenceBrowserSession(env = process.env) {
       lastSyncError = "Geen Confluence SSO-cookies gevonden in de browser. Open Confluence eerst in die browser.";
       return { ok: false, cookie: "", error: lastSyncError, cdpAvailable: true, endpoint: endpoint.base };
     }
-    rememberBrowserSyncedCookie(cookie, endpoint.base);
+    rememberBrowserSyncedCookies(cookies, endpoint.base);
     persistBrowserCookie(cookie, env);
     return {
       ok: true,
@@ -397,6 +469,9 @@ export function mergeConfluenceCookieHeaders(...cookieHeaders) {
 
 export function resolveConfluenceCookieHeader(config, env = process.env) {
   const manual = trimEnv(config?.manualCookie);
-  const browser = manual ? "" : primeBrowserCookieFromDisk(env) || getBrowserSyncedCookie();
+  if (manual) return mergeConfluenceCookieHeaders(manual, "");
+  const target = config?.baseUrl || DEFAULT_CONFLUENCE_URL;
+  if (getCachedBrowserCookies().length) return resolveBrowserCookieHeaderForUrl(target, env);
+  const browser = primeBrowserCookieFromDisk(env) || getBrowserSyncedCookie();
   return mergeConfluenceCookieHeaders(manual, browser);
 }

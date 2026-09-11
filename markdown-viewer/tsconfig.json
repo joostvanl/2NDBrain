@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "esModuleInterop": true,
     "strict": true,
+    "allowJs": true,
     "skipLibCheck": true,
     "noEmit": true,
     "isolatedModules": true,

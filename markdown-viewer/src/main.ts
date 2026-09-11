@@ -91,6 +91,7 @@ import {
   wrapRangeWithHighlight,
   type ReviewComment,
 } from "./reviewComments";
+import { shouldMergeDocumentChatIntoSession } from "./nexus-chat-session-policy.mjs";
 import { buildProseSheets, type VisualSheetSplit } from "./visualPages";
 
 /** Browservoorspraak (Web Speech API); niet overal in lib.dom aanwezig. */
@@ -4482,8 +4483,20 @@ ${transcript}`;
     }
   }
 
-  function applyReviewPack(pack: { comments: ReviewComment[]; agentChatUiHistory: AgentChatTurn[] }) {
+  function applyReviewPack(
+    pack: { comments: ReviewComment[]; agentChatUiHistory: AgentChatTurn[] },
+    reason: "document-load" | "agent-run" = "document-load",
+  ) {
     reviewComments = pack.comments;
+    if (shouldMergeDocumentChatIntoSession(reason) && pack.agentChatUiHistory.length) {
+      const existing = new Set(agentChatHistory.map((t) => `${t.role}\0${t.mode || ""}\0${t.content}`));
+      for (const turn of pack.agentChatUiHistory) {
+        const sig = `${turn.role}\0${turn.mode || ""}\0${turn.content}`;
+        if (existing.has(sig)) continue;
+        agentChatHistory.push(turn);
+        existing.add(sig);
+      }
+    }
     rerenderAgentChatMessages();
   }
 
@@ -4716,7 +4729,7 @@ ${transcript}`;
         currentMd = res.markdown;
         if (docName) {
           try {
-            applyReviewPack(await fetchReviewComments(docName));
+            applyReviewPack(await fetchReviewComments(docName), "agent-run");
           } catch {
             /* ongewijzigd laten */
           }
@@ -5854,6 +5867,7 @@ ${transcript}`;
       await loadDocumentData(name, tplName);
       await mountEditorSurface();
       syncToolbarDocTitle();
+      refreshAgentChatModeUi();
     } finally {
       refreshFileTree();
     }
@@ -6006,8 +6020,8 @@ ${transcript}`;
     selectedFolder = "";
     hideConfluenceImportDialog();
     hideConfluenceSearchDialog();
-    clearAgentChat();
     await loadSelection();
+    refreshAgentChatModeUi();
     status.textContent = `${externalFileLabel} — geïmporteerd uit Confluence v${externalConfluencePage.version}. Autosave staat uit; gebruik handmatig opslaan om terug te schrijven.`;
   }
 
@@ -6128,9 +6142,9 @@ ${transcript}`;
         .filter((o) => o.value === EXTERNAL_MARKDOWN_VALUE)
         .forEach((o) => o.remove());
     }
-    clearAgentChat();
     selectedFolder = folderOfMarkdownPath(fileSelect.value);
     await loadSelection();
+    refreshAgentChatModeUi();
   });
   tplSelect.addEventListener("change", () => {
     try {

@@ -3,6 +3,7 @@ import { defaultTemplate, mergeTemplate } from "./defaultTemplate";
 import type { ViewerTemplate } from "./templateTypes";
 import { applyCssVars, templateToCssVars } from "./applyTemplate";
 import { applyProjectColorToElement, projectColorForName } from "./project-colors";
+import { shouldMergeDocumentChatIntoSession } from "./nexus-chat-session-policy.mjs";
 import {
   agentChat,
   applyAgentMemoryActions,
@@ -6550,9 +6551,14 @@ ${transcript}`;
     void Promise.all([runMermaidInRoot(agentChatMessages), runChartJsInRoot(agentChatMessages)]);
   }
 
-  function applyReviewPack(pack: { comments: ReviewComment[]; agentChatUiHistory: AgentChatTurn[] }) {
+  function applyReviewPack(
+    pack: { comments: ReviewComment[]; agentChatUiHistory: AgentChatTurn[] },
+    reason: "document-load" | "agent-run" = "document-load",
+  ) {
     reviewComments = pack.comments;
-    syncDocumentChatToSession(pack.agentChatUiHistory);
+    if (shouldMergeDocumentChatIntoSession(reason)) {
+      syncDocumentChatToSession(pack.agentChatUiHistory);
+    }
     rerenderAgentChatMessages();
   }
 
@@ -7110,7 +7116,7 @@ ${transcript}`;
         currentMd = res.markdown;
         if (docName) {
           try {
-            applyReviewPack(await fetchReviewComments(docName));
+            applyReviewPack(await fetchReviewComments(docName), "agent-run");
           } catch {
             /* ongewijzigd laten */
           }
@@ -7138,7 +7144,7 @@ ${transcript}`;
           }
           if (docName && activePath !== docName) {
             try {
-              applyReviewPack(await fetchReviewComments(activePath));
+              applyReviewPack(await fetchReviewComments(activePath), "agent-run");
             } catch {
               /* ongewijzigd laten */
             }
@@ -8437,6 +8443,7 @@ ${transcript}`;
       await loadDocumentData(name, tplName);
       await mountEditorSurface();
       syncToolbarDocTitle();
+      refreshAgentChatModeUi();
     } finally {
       refreshFileTree();
     }
@@ -8607,8 +8614,8 @@ ${transcript}`;
     selectedFolder = "";
     hideConfluenceImportDialog();
     hideConfluenceSearchDialog();
-    clearAgentChat();
     await loadSelection();
+    refreshAgentChatModeUi();
     status.textContent = `${externalFileLabel} — geïmporteerd uit Confluence v${externalConfluencePage.version}. Autosave staat uit; gebruik handmatig opslaan om terug te schrijven.`;
   }
 
@@ -8729,9 +8736,9 @@ ${transcript}`;
         .filter((o) => o.value === EXTERNAL_MARKDOWN_VALUE)
         .forEach((o) => o.remove());
     }
-    clearAgentChat();
     selectedFolder = folderOfMarkdownPath(fileSelect.value);
     await loadSelection();
+    refreshAgentChatModeUi();
   });
   tplSelect.addEventListener("change", () => {
     try {
